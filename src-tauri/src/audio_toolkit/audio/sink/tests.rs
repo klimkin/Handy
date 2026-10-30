@@ -212,3 +212,90 @@ fn finish_returns_the_detector_for_the_next_recording() {
     assert_eq!(captured.vad.frame_samples(), FRAME);
     assert_eq!(captured.vad.hangover_for(VadPolicy::Streaming), 20);
 }
+
+#[test]
+fn raw_coverage_counts_valid_frames_and_fallback_lineage_excludes_padding() {
+    let mut h = harness(VadPolicy::Streaming);
+    h.sink.process_chunk(chunk(&[-1.0, 1.0, 0.0, 0.0], 2));
+    let audio = h.sink.finish();
+    assert_eq!(audio.valid_frames, 2);
+    assert_eq!(audio.first_vad_range, Some((0, 2)));
+    assert_eq!(audio.samples.len(), FRAME);
+    assert!(audio.first_audio.is_some());
+}
+#[test]
+fn smoothed_vad_preserves_prefill_origin_and_partial_last_range() {
+    let scripted = ScriptedVad {
+        frame_samples: FRAME,
+        ..Default::default()
+    };
+    let smoothed = crate::audio_toolkit::vad::SmoothedVad::new(Box::new(scripted), 2, 0, 1);
+    let (tx, _) = mpsc::channel();
+    let mut sink = CaptureSink::new(
+        CaptureVad::new(Box::new(smoothed), 0, 0),
+        VadPolicy::Offline,
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        tx,
+    );
+    sink.process_chunk(chunk(&[0.0; FRAME], FRAME));
+    sink.process_chunk(chunk(&[1.0, 1.0, 0.0, 0.0], 2));
+    let audio = sink.finish();
+    assert_eq!(audio.valid_frames, 6);
+    assert_eq!(audio.first_vad_range, Some((0, 6)));
+    assert_eq!(audio.samples.len(), 8);
+}
+#[test]
+fn unproven_detector_output_does_not_fabricate_source_range() {
+    let mut h = harness(VadPolicy::Offline);
+    h.sink.process_chunk(chunk(&[1.0; FRAME], FRAME));
+    let audio = h.sink.finish();
+    assert!(audio.first_vad.is_some());
+    assert!(audio.first_vad_range.is_none());
+}
+
+#[test]
+fn cancel_drain_keeps_capture_after_owner_moves_to_stop_worker() {
+    use crate::managers::stats::trace::{FinalizedTrace, InputOrigin, TerminalOutcome};
+    use crate::managers::stats::StatsManager;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(StatsManager::test_at(dir.path().join("stats.db")));
+    let mut run = stats.begin(
+        stats.input_stamp(InputOrigin::ShortcutCallback),
+        Default::default(),
+    );
+    let mut h = harness(VadPolicy::Offline);
+    h.sink = h.sink.with_trace(Some(run.reporter()));
+    h.sink.process_chunk(chunk(&[1.0; FRAME], FRAME));
+    run.set_stop(Instant::now());
+    let (resume, drain_complete) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        drain_complete.recv().unwrap();
+        run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+    });
+
+    let captured = h.sink.finish();
+    let delivery = captured.first_audio;
+    let _ = captured.publish_capture(3, false);
+    drop(captured);
+    resume.send(()).unwrap();
+    worker.join().unwrap();
+    stats.shutdown().unwrap();
+
+    let json = std::fs::read_to_string(stats.trace_path()).unwrap();
+    let trace: FinalizedTrace = serde_json::from_str(json.trim()).unwrap();
+    assert!(delivery.is_some());
+    assert!(trace.capture.first_delivery_us.is_some());
+    assert_eq!(trace.capture.valid_frames, FRAME as u64);
+    assert_eq!(trace.capture.dropped_frames, 3);
+    assert!(trace.capture.speech_detected);
+    assert!(matches!(trace.outcome, TerminalOutcome::Cancelled));
+    assert!(trace.events.iter().any(|event| matches!(
+        event.event,
+        crate::managers::stats::trace::Event::CaptureStopped
+    )));
+    assert!(trace.output.is_none());
+    assert!(trace.metrics.output_gap.us.is_none());
+}

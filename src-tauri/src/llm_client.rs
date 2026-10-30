@@ -7,6 +7,41 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
 
+use crate::managers::stats::trace::{Event, PhaseKind, PhaseOutcome, TraceReporter};
+use std::time::Instant;
+
+#[derive(Default)]
+pub struct CompletionOptions {
+    pub disable_reasoning: bool,
+    pub trace: Option<TraceReporter>,
+}
+struct CompletionAttempt {
+    trace: Option<TraceReporter>,
+    id: Option<u64>,
+}
+impl CompletionAttempt {
+    fn begin(trace: Option<TraceReporter>) -> Self {
+        let id = trace
+            .as_ref()
+            .map(|t| t.begin(PhaseKind::PostProcessAttempt));
+        Self { trace, id }
+    }
+    fn finish(&mut self, outcome: PhaseOutcome) {
+        if let (Some(t), Some(id)) = (&self.trace, self.id.take()) {
+            t.end(id, outcome);
+        }
+    }
+    fn error(&mut self, prefix: &str, error: &reqwest::Error) -> String {
+        self.finish(PhaseOutcome::Failed);
+        report_reqwest_error(prefix, error)
+    }
+}
+impl Drop for CompletionAttempt {
+    fn drop(&mut self) {
+        self.finish(PhaseOutcome::Cancelled);
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
@@ -345,22 +380,13 @@ pub async fn send_chat_completion(
     api_key: String,
     model: &str,
     prompt: String,
-    disable_reasoning: bool,
+    options: CompletionOptions,
 ) -> Result<Option<String>, String> {
     if provider.api_format == PostProcessApiFormat::Anthropic {
-        return send_anthropic_message(provider, api_key, model, prompt).await;
+        return send_anthropic_message(provider, api_key, model, prompt, options.trace).await;
     }
 
-    send_chat_completion_with_schema(
-        provider,
-        api_key,
-        model,
-        prompt,
-        None,
-        None,
-        disable_reasoning,
-    )
-    .await
+    send_chat_completion_with_schema(provider, api_key, model, prompt, None, None, options).await
 }
 
 /// Send a chat completion request with structured output support.
@@ -380,7 +406,7 @@ pub async fn send_chat_completion_with_schema(
     user_content: String,
     system_prompt: Option<String>,
     json_schema: Option<Value>,
-    disable_reasoning: bool,
+    options: CompletionOptions,
 ) -> Result<Option<String>, String> {
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
@@ -420,7 +446,7 @@ pub async fn send_chat_completion_with_schema(
     });
 
     let key = endpoint_key(provider, model);
-    let reasoning = if disable_reasoning && !is_known_rejected(&key) {
+    let reasoning = if options.disable_reasoning && !is_known_rejected(&key) {
         reasoning_disable_params(provider)
     } else {
         ReasoningParams::default()
@@ -434,12 +460,13 @@ pub async fn send_chat_completion_with_schema(
         reasoning,
     };
 
+    let mut attempt = CompletionAttempt::begin(options.trace.clone());
     let mut response = client
         .post(&url)
         .json(&request_body)
         .send()
         .await
-        .map_err(|e| report_reqwest_error("HTTP request failed", &e))?;
+        .map_err(|e| attempt.error("HTTP request failed", &e))?;
     let mut status = response.status();
     debug!(
         "Chat completion response received with status {} over {:?} from {}",
@@ -462,13 +489,18 @@ pub async fn send_chat_completion_with_schema(
             status, error_text
         );
 
+        attempt.finish(PhaseOutcome::Failed);
+        if let Some(t) = &options.trace {
+            t.event(Instant::now(), Event::PostProcessFallback);
+        }
+        attempt = CompletionAttempt::begin(options.trace.clone());
         request_body.reasoning = ReasoningParams::default();
         response = client
             .post(&url)
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| report_reqwest_error("HTTP retry failed", &e))?;
+            .map_err(|e| attempt.error("HTTP retry failed", &e))?;
         status = response.status();
         debug!(
             "Chat completion retry response received with status {} over {:?} from {}",
@@ -491,6 +523,7 @@ pub async fn send_chat_completion_with_schema(
             .text()
             .await
             .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        attempt.finish(PhaseOutcome::Failed);
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
@@ -500,9 +533,10 @@ pub async fn send_chat_completion_with_schema(
     let completion: ChatCompletionResponse = response
         .json()
         .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
+        .map_err(|e| attempt.error("Failed to parse API response", &e))?;
 
     let Some(choice) = completion.choices.into_iter().next() else {
+        attempt.finish(PhaseOutcome::Success);
         return Ok(None);
     };
 
@@ -510,9 +544,11 @@ pub async fn send_chat_completion_with_schema(
     // it would silently drop the end of the dictation (or, for structured
     // output, paste unparseable JSON).
     if choice.finish_reason.as_deref() == Some("length") {
+        attempt.finish(PhaseOutcome::Failed);
         return Err("Response was truncated at the provider's output token limit".to_string());
     }
 
+    attempt.finish(PhaseOutcome::Success);
     Ok(choice.message.content)
 }
 
@@ -526,6 +562,7 @@ async fn send_anthropic_message(
     api_key: String,
     model: &str,
     prompt: String,
+    trace: Option<TraceReporter>,
 ) -> Result<Option<String>, String> {
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
 
@@ -543,12 +580,14 @@ async fn send_anthropic_message(
         }],
     };
 
-    let response = create_client(provider, &api_key)?
+    let client = create_client(provider, &api_key)?;
+    let mut attempt = CompletionAttempt::begin(trace);
+    let response = client
         .post(&url)
         .json(&request_body)
         .send()
         .await
-        .map_err(|e| report_reqwest_error("HTTP request failed", &e))?;
+        .map_err(|e| attempt.error("HTTP request failed", &e))?;
     let status = response.status();
     debug!(
         "Anthropic Messages response received with status {} over {:?} from {}",
@@ -562,6 +601,7 @@ async fn send_anthropic_message(
             .text()
             .await
             .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        attempt.finish(PhaseOutcome::Failed);
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
@@ -571,17 +611,19 @@ async fn send_anthropic_message(
     let message: AnthropicMessagesResponse = response
         .json()
         .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
+        .map_err(|e| attempt.error("Failed to parse API response", &e))?;
 
     // A response cut off at the token budget is incomplete; pasting it would
     // silently drop the end of the dictation.
     if message.stop_reason.as_deref() == Some("max_tokens") {
+        attempt.finish(PhaseOutcome::Failed);
         return Err(format!(
             "Response was truncated at the {} token limit",
             ANTHROPIC_MAX_TOKENS
         ));
     }
 
+    attempt.finish(PhaseOutcome::Success);
     Ok(message.into_text())
 }
 
@@ -922,7 +964,10 @@ mod tests {
             "key".to_string(),
             "claude-haiku",
             "raw text".to_string(),
-            true,
+            CompletionOptions {
+                disable_reasoning: true,
+                ..Default::default()
+            },
         )
         .await;
         assert_eq!(result, Ok(Some("Cleaned text".to_string())));
@@ -940,7 +985,7 @@ mod tests {
             "key".to_string(),
             "test-model",
             "raw text".to_string(),
-            false,
+            CompletionOptions::default(),
         )
         .await;
         assert!(result.unwrap_err().contains("truncated"));
@@ -958,7 +1003,10 @@ mod tests {
             "key".to_string(),
             "claude-haiku",
             "raw text".to_string(),
-            true,
+            CompletionOptions {
+                disable_reasoning: true,
+                ..Default::default()
+            },
         )
         .await;
         assert!(result.unwrap_err().contains("truncated"));

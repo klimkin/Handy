@@ -1,4 +1,8 @@
 use crate::input::{self, EnigoState};
+use crate::managers::stats::trace::{
+    CompletionBasis, Event, OutputFailure, OutputKind, OutputReceipt, OutputResult,
+    OutputSettlement, TraceReporter,
+};
 #[cfg(target_os = "linux")]
 use crate::settings::TypingTool;
 use crate::settings::{get_settings, AutoSubmitKey, ClipboardHandling, PasteMethod};
@@ -8,7 +12,7 @@ use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::{mpsc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -61,13 +65,13 @@ fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), Str
 }
 
 fn finish_clipboard_paste(
-    paste_result: Result<(), String>,
+    paste_result: Result<(), OutputFailure>,
     paste_delay_after_ms: u64,
-    restore_clipboard: impl FnOnce(),
-) -> Result<(), String> {
+    restore_clipboard: impl FnOnce() -> Result<(), OutputFailure>,
+) -> Result<(), OutputFailure> {
     std::thread::sleep(Duration::from_millis(paste_delay_after_ms));
-    restore_clipboard();
-    paste_result
+    let restore_result = restore_clipboard();
+    paste_result.and(restore_result)
 }
 
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
@@ -77,7 +81,8 @@ fn paste_via_clipboard(
     paste_method: &PasteMethod,
     paste_delay_ms: u64,
     paste_delay_after_ms: u64,
-) -> Result<(), String> {
+    trace: Option<&TraceReporter>,
+) -> Result<(), OutputFailure> {
     let clipboard = app_handle.clipboard();
     let saved_text = clipboard.read_text().ok().filter(|t| !t.is_empty());
     // Only probe for an image when there is no text to restore. Text is by far the
@@ -90,7 +95,7 @@ fn paste_via_clipboard(
     };
 
     // Write text to clipboard first
-    write_text_to_clipboard(app_handle, text)?;
+    write_text_to_clipboard(app_handle, text).map_err(|_| OutputFailure::Injection)?;
 
     std::thread::sleep(Duration::from_millis(paste_delay_ms));
 
@@ -107,34 +112,47 @@ fn paste_via_clipboard(
         // Fall back to enigo if no native tool handled it
         if !key_combo_sent {
             let paste_method = *paste_method;
-            with_enigo(app_handle, move |enigo| match paste_method {
-                // The legacy path cannot detect a mistimed chord, so it keeps the
-                // conservative 100ms modifier hold.
-                PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo, 100),
-                PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo, 100),
-                PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo, 100),
-                _ => Err("Invalid paste method for clipboard paste".into()),
+            let trace = trace.cloned();
+            with_enigo(app_handle, move |enigo| {
+                match paste_method {
+                    PasteMethod::CtrlV => input::send_paste_ctrl_v(enigo, 100),
+                    PasteMethod::CtrlShiftV => input::send_paste_ctrl_shift_v(enigo, 100),
+                    PasteMethod::ShiftInsert => input::send_paste_shift_insert(enigo, 100),
+                    _ => Err("Invalid paste method for clipboard paste".into()),
+                }?;
+                if let Some(trace) = trace {
+                    trace.event(Instant::now(), Event::PasteInjected);
+                }
+                Ok(())
             })?;
+        } else if let Some(trace) = trace {
+            trace.event(Instant::now(), Event::PasteInjected);
         }
-
         Ok(())
     })();
 
-    finish_clipboard_paste(paste_result, paste_delay_after_ms, || {
-        // Restore original clipboard content even when key injection failed.
-        // Text takes priority so this path stays identical to the previous behavior;
-        // an image is only restored when the clipboard held no text at all, which is
-        // the case that used to silently wipe screenshots.
-        if let Some(clipboard_content) = saved_text {
-            let _ = write_text_to_clipboard(app_handle, &clipboard_content);
-        } else if let Some(image) = saved_image {
-            info!("Restoring image to clipboard");
-            let _ = clipboard.write_image(&image);
-        } else {
-            // Nothing was there to begin with — don't leave the transcription behind.
-            let _ = clipboard.clear();
-        }
-    })
+    finish_clipboard_paste(
+        paste_result.map_err(|_| OutputFailure::Injection),
+        paste_delay_after_ms,
+        || {
+            // Restore original clipboard content even when key injection failed.
+            // Text takes priority so this path stays identical to the previous behavior;
+            // an image is only restored when the clipboard held no text at all, which is
+            // the case that used to silently wipe screenshots.
+            if let Some(clipboard_content) = saved_text {
+                write_text_to_clipboard(app_handle, &clipboard_content)
+                    .map_err(|_| OutputFailure::Restore)
+            } else if let Some(image) = saved_image {
+                info!("Restoring image to clipboard");
+                clipboard
+                    .write_image(&image)
+                    .map_err(|_| OutputFailure::Restore)
+            } else {
+                // Nothing was there to begin with — don't leave the transcription behind.
+                clipboard.clear().map_err(|_| OutputFailure::Restore)
+            }
+        },
+    )
 }
 
 /// Attempts to send a key combination using Linux-native tools.
@@ -794,107 +812,149 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
-/// Pastes `text` into the focused app. Call from a worker thread, never the main
-/// thread: it sleeps between steps (input injection hops via `with_enigo`).
-pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
-    let _paste = PASTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let settings = get_settings(&app_handle);
-    let paste_method = settings.paste_method;
-    let paste_delay_ms = settings.paste_delay_ms;
-    let paste_delay_after_ms = settings.paste_delay_after_ms;
-
-    // Append trailing space if setting is enabled
-    let text = if settings.append_trailing_space {
-        format!("{} ", text)
-    } else {
-        text
-    };
-
-    info!(
-        "Using paste method: {:?}, delay before: {}ms, delay after: {}ms",
-        paste_method, paste_delay_ms, paste_delay_after_ms
-    );
-
-    // Perform the paste operation
+fn output_kind(paste_method: PasteMethod, handling: ClipboardHandling) -> OutputKind {
     match paste_method {
-        PasteMethod::None => {
-            info!("PasteMethod::None selected - skipping paste action");
+        PasteMethod::None if handling == ClipboardHandling::CopyToClipboard => {
+            OutputKind::ClipboardOnly
         }
-        PasteMethod::Direct => {
-            paste_direct(
-                &text,
-                &app_handle,
-                #[cfg(target_os = "linux")]
-                settings.typing_tool,
-            )?;
-        }
-        PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
-            // Debug-gated receipt-sequenced paste (#502): restore the clipboard
-            // after the target actually reads the transcript, not on a timer.
-            // On success it fully handles the paste (including auto-submit and
-            // clipboard handling) asynchronously; on failure fall through to
-            // the legacy path untouched.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            if settings.reliable_paste {
-                // Runs entirely on the main thread, as it requires.
-                let (text, app) = (text.clone(), app_handle.clone());
-                let (auto_submit, auto_submit_key, clipboard_handling) = (
-                    settings.auto_submit,
-                    settings.auto_submit_key,
-                    settings.clipboard_handling,
-                );
-                let reliable_result = with_enigo(&app_handle, move |enigo| {
-                    crate::paste_tx::try_reliable_paste(
-                        &text,
-                        &app,
-                        &paste_method,
-                        enigo,
-                        auto_submit,
-                        auto_submit_key,
-                        clipboard_handling,
-                    )
-                });
-                match reliable_result {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        log::warn!("Reliable paste unavailable ({e}); falling back to legacy paste")
+        PasteMethod::None => OutputKind::None,
+        PasteMethod::Direct => OutputKind::DirectTyping,
+        PasteMethod::ExternalScript => OutputKind::ExternalScript,
+        _ => OutputKind::ClipboardPaste,
+    }
+}
+
+/// Starts output on a worker and returns its completion notification.
+/// Wait only after this returns, outside the main thread and input locks.
+pub(crate) fn paste_with_receipt(
+    text: String,
+    app: AppHandle,
+    trace: TraceReporter,
+    settings: crate::settings::AppSettings,
+) -> OutputReceipt {
+    trace.event(Instant::now(), Event::OutputStarted);
+    match paste_inner(text, app, Some(trace), Some(settings)) {
+        Ok(receipt) => receipt,
+        Err(settlement) => OutputReceipt::immediate(settlement),
+    }
+}
+
+/// Compatibility entry point. Reliable output settles asynchronously, so callers
+/// needing completion must use `paste_with_receipt` on their output worker.
+pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
+    paste_inner(text, app_handle, None, None)
+        .map(|_| ())
+        .map_err(|settlement| format!("Output failed: {:?}", settlement.result))
+}
+
+fn paste_inner(
+    text: String,
+    app_handle: AppHandle,
+    trace: Option<TraceReporter>,
+    settings: Option<crate::settings::AppSettings>,
+) -> Result<OutputReceipt, OutputSettlement> {
+    let _paste = PASTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let settings = settings.unwrap_or_else(|| get_settings(&app_handle));
+    let paste_method = settings.paste_method;
+    let kind = output_kind(paste_method, settings.clipboard_handling);
+    let result: Result<OutputReceipt, OutputFailure> = (|| {
+        let text = if settings.append_trailing_space {
+            format!("{text} ")
+        } else {
+            text
+        };
+
+        let basis = match paste_method {
+            PasteMethod::None => None,
+            PasteMethod::Direct => {
+                paste_direct(
+                    &text,
+                    &app_handle,
+                    #[cfg(target_os = "linux")]
+                    settings.typing_tool,
+                )
+                .map_err(|_| OutputFailure::Typing)?;
+                Some(CompletionBasis::DirectTypingReturn)
+            }
+            PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                if settings.reliable_paste {
+                    let (text, app) = (text.clone(), app_handle.clone());
+                    let options = crate::paste_tx::PasteOptions {
+                        auto_submit: settings.auto_submit,
+                        auto_submit_key: settings.auto_submit_key,
+                        clipboard_handling: settings.clipboard_handling,
+                        delay_after: Duration::from_millis(settings.paste_delay_after_ms),
+                        trace: trace.clone(),
+                    };
+                    std::thread::sleep(Duration::from_millis(settings.paste_delay_ms));
+                    let reliable_result = with_enigo(&app_handle, move |enigo| {
+                        crate::paste_tx::try_reliable_paste(
+                            &text,
+                            &app,
+                            &paste_method,
+                            enigo,
+                            options,
+                        )
+                    });
+                    match reliable_result {
+                        Ok(receipt) => return Ok(receipt),
+                        Err(_) => {
+                            log::warn!("Reliable paste unavailable; falling back to legacy paste")
+                        }
                     }
                 }
+                paste_via_clipboard(
+                    &text,
+                    &app_handle,
+                    &paste_method,
+                    settings.paste_delay_ms,
+                    settings.paste_delay_after_ms,
+                    trace.as_ref(),
+                )?;
+                Some(CompletionBasis::SynchronousOutputReturn)
             }
-            paste_via_clipboard(
-                &text,
-                &app_handle,
-                &paste_method,
-                paste_delay_ms,
-                paste_delay_after_ms,
-            )?
-        }
-        PasteMethod::ExternalScript => {
-            let script_path = settings
-                .external_script_path
-                .as_ref()
-                .filter(|p| !p.is_empty())
-                .ok_or("External script path is not configured")?;
-            paste_via_external_script(&text, script_path)?;
-        }
-    }
-
-    if should_send_auto_submit(settings.auto_submit, paste_method) {
-        std::thread::sleep(Duration::from_millis(50));
-        let auto_submit_key = settings.auto_submit_key;
-        if let Err(error) = with_enigo(&app_handle, move |enigo| {
-            send_return_key(enigo, auto_submit_key)
-        }) {
-            log::warn!("Paste succeeded, but auto-submit failed: {error}");
-        }
-    }
-
-    // After pasting, optionally copy to clipboard based on settings
-    if settings.clipboard_handling == ClipboardHandling::CopyToClipboard {
-        write_text_to_clipboard(&app_handle, &text)?;
-    }
-
-    Ok(())
+            PasteMethod::ExternalScript => {
+                let script_path = settings
+                    .external_script_path
+                    .as_ref()
+                    .filter(|path| !path.is_empty())
+                    .ok_or(OutputFailure::Script)?;
+                paste_via_external_script(&text, script_path).map_err(|_| OutputFailure::Script)?;
+                Some(CompletionBasis::ScriptProcessExit)
+            }
+        };
+        let submit = if should_send_auto_submit(settings.auto_submit, paste_method) {
+            std::thread::sleep(Duration::from_millis(50));
+            let key = settings.auto_submit_key;
+            with_enigo(&app_handle, move |enigo| send_return_key(enigo, key))
+                .map_err(|_| OutputFailure::AutoSubmit)
+        } else {
+            Ok(())
+        };
+        let copied = settings.clipboard_handling == ClipboardHandling::CopyToClipboard;
+        let copy = if copied {
+            write_text_to_clipboard(&app_handle, &text).map_err(|_| OutputFailure::Other)
+        } else {
+            Ok(())
+        };
+        submit.and(copy)?;
+        let result = match basis {
+            Some(basis) => OutputResult::Completed(basis),
+            None if copied => OutputResult::Completed(CompletionBasis::ClipboardWrite),
+            None => OutputResult::NotRequested,
+        };
+        Ok(OutputReceipt::immediate(OutputSettlement {
+            at: Instant::now(),
+            kind,
+            result,
+        }))
+    })();
+    result.map_err(|failure| OutputSettlement {
+        at: Instant::now(),
+        kind,
+        result: OutputResult::Failed(failure),
+    })
 }
 
 #[cfg(test)]
@@ -1001,12 +1061,31 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
     #[test]
     fn clipboard_is_restored_before_key_injection_error_is_returned() {
         let restored = Cell::new(false);
-        let result = finish_clipboard_paste(Err("input failed".into()), 0, || {
+        let result = finish_clipboard_paste(Err(OutputFailure::Injection), 0, || {
             restored.set(true);
+            Ok(())
         });
 
-        assert_eq!(result.unwrap_err(), "input failed");
+        assert!(matches!(result, Err(OutputFailure::Injection)));
         assert!(restored.get());
+    }
+
+    #[test]
+    fn restoration_failure_prevents_clipboard_success() {
+        let result = finish_clipboard_paste(Ok(()), 0, || Err(OutputFailure::Restore));
+        assert!(matches!(result, Err(OutputFailure::Restore)));
+    }
+
+    #[test]
+    fn none_output_distinguishes_clipboard_only() {
+        assert!(matches!(
+            output_kind(PasteMethod::None, ClipboardHandling::CopyToClipboard),
+            OutputKind::ClipboardOnly
+        ));
+        assert!(matches!(
+            output_kind(PasteMethod::None, ClipboardHandling::DontModify),
+            OutputKind::None
+        ));
     }
 
     #[cfg(unix)]

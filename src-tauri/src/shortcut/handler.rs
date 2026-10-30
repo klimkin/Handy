@@ -32,7 +32,10 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
-    let triggered_at = std::time::Instant::now();
+    let stamp = app
+        .state::<Arc<crate::managers::stats::StatsManager>>()
+        .input_stamp(crate::managers::stats::trace::InputOrigin::ShortcutCallback);
+    let triggered_at = stamp.at;
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.
@@ -44,7 +47,7 @@ pub fn handle_shortcut_event(
                 is_pressed,
                 settings.shortcut_activation,
                 std::time::Duration::from_millis(settings.hold_threshold_ms),
-                triggered_at,
+                stamp,
             );
         } else {
             warn!("TranscriptionCoordinator is not initialized");

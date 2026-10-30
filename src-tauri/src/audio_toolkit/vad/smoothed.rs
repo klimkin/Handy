@@ -1,4 +1,4 @@
-use super::{VadFrame, VadTailReport, VoiceActivityDetector};
+use super::{VadFrame, VadOutput, VadTailReport, VoiceActivityDetector};
 use anyhow::Result;
 use std::collections::VecDeque;
 
@@ -8,6 +8,7 @@ struct BufferedFrame {
     samples: Vec<f32>,
     emitted: bool,
     voiced: bool,
+    raw_range: Option<(u64, u64)>,
 }
 
 pub struct SmoothedVad {
@@ -51,13 +52,18 @@ impl SmoothedVad {
     }
 }
 
-impl VoiceActivityDetector for SmoothedVad {
-    fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> Result<VadFrame<'a>> {
+impl SmoothedVad {
+    fn process<'a>(
+        &'a mut self,
+        frame: &'a [f32],
+        range: Option<(u64, u64)>,
+    ) -> Result<VadOutput<'a>> {
         // 1. Buffer every incoming frame for possible pre-roll
         self.frame_buffer.push_back(BufferedFrame {
             samples: frame.to_vec(),
             emitted: false,
             voiced: false,
+            raw_range: range,
         });
         while self.frame_buffer.len() > self.prefill_frames + 1 {
             self.frame_buffer.pop_front();
@@ -81,14 +87,29 @@ impl VoiceActivityDetector for SmoothedVad {
 
                     // Collect prefill + current frame
                     self.temp_out.clear();
+                    let mut raw_range = None;
+                    let mut lineage_valid = true;
                     for buffered in self.frame_buffer.iter_mut().filter(|f| !f.emitted) {
+                        match (raw_range, buffered.raw_range) {
+                            (None, Some(range)) => raw_range = Some(range),
+                            (Some((first, count)), Some((next, len))) if first + count == next => {
+                                raw_range = Some((first, count + len))
+                            }
+                            _ => lineage_valid = false,
+                        }
                         self.temp_out.extend(buffered.samples.iter());
                         buffered.emitted = true;
                     }
-                    Ok(VadFrame::Speech(&self.temp_out))
+                    Ok(VadOutput {
+                        frame: VadFrame::Speech(&self.temp_out),
+                        raw_range: lineage_valid.then_some(raw_range).flatten(),
+                    })
                 } else {
                     // Not enough frames yet, still silence
-                    Ok(VadFrame::Noise)
+                    Ok(VadOutput {
+                        frame: VadFrame::Noise,
+                        raw_range: None,
+                    })
                 }
             }
 
@@ -96,7 +117,10 @@ impl VoiceActivityDetector for SmoothedVad {
             (true, true) => {
                 self.hangover_counter = self.hangover_frames;
                 self.mark_last_emitted();
-                Ok(VadFrame::Speech(frame))
+                Ok(VadOutput {
+                    frame: VadFrame::Speech(frame),
+                    raw_range: range,
+                })
             }
 
             // End of Speech or interruption during onset phase
@@ -104,21 +128,41 @@ impl VoiceActivityDetector for SmoothedVad {
                 if self.hangover_counter > 0 {
                     self.hangover_counter -= 1;
                     self.mark_last_emitted();
-                    Ok(VadFrame::Speech(frame))
+                    Ok(VadOutput {
+                        frame: VadFrame::Speech(frame),
+                        raw_range: range,
+                    })
                 } else {
                     self.in_speech = false;
-                    Ok(VadFrame::Noise)
+                    Ok(VadOutput {
+                        frame: VadFrame::Noise,
+                        raw_range: None,
+                    })
                 }
             }
 
             // Silence or broken onset sequence
             (false, false) => {
                 self.onset_counter = 0; // Reset onset counter on silence
-                Ok(VadFrame::Noise)
+                Ok(VadOutput {
+                    frame: VadFrame::Noise,
+                    raw_range: None,
+                })
             }
         }
     }
-
+}
+impl VoiceActivityDetector for SmoothedVad {
+    fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> Result<VadFrame<'a>> {
+        self.process(frame, None).map(|out| out.frame)
+    }
+    fn push_frame_with_range<'a>(
+        &'a mut self,
+        frame: &'a [f32],
+        range: (u64, u64),
+    ) -> Result<VadOutput<'a>> {
+        self.process(frame, Some(range))
+    }
     fn frame_samples(&self) -> usize {
         self.inner_vad.frame_samples()
     }

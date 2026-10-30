@@ -24,6 +24,11 @@ const UNKNOWN_LANGUAGE = ":unknown";
 const rowKey = (group: StatsSummary["groups"][number]) =>
   `${group.model}|${group.language ?? ""}|${group.variant}`;
 
+type CopyStatus =
+  | { kind: "idle" }
+  | { kind: "copied" }
+  | { kind: "error"; error: string };
+
 interface SegmentedProps<T extends string> {
   label: string;
   value: T;
@@ -60,8 +65,9 @@ function Segmented<T extends string>({
 export const StatisticsSettings: React.FC = () => {
   const { t, i18n } = useTranslation();
   const [summary, setSummary] = useState<StatsSummary | null>(null);
+  const [copyStatus, setCopyStatus] = useState<CopyStatus>({ kind: "idle" });
   const [error, setError] = useState<string | null>(null);
-  const [metric, setMetric] = useState<Metric>("exit_ms");
+  const [metric, setMetric] = useState<Metric>("output_gap_ms");
   const tabsId = useId();
   const [sortBy, setSortBy] = useState<SortBy>("speed");
   const [language, setLanguage] = useState(ALL_LANGUAGES);
@@ -269,6 +275,70 @@ export const StatisticsSettings: React.FC = () => {
           </div>
         </div>
 
+        {summary && (
+          <div className="space-y-2 border-t border-line p-3 text-xs text-ink-3">
+            {summary.legacy_runs > 0 && (
+              <p>
+                {t("settings.statistics.legacyTimingHint", {
+                  runs: summary.legacy_runs,
+                })}
+              </p>
+            )}
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0">
+                {t("settings.statistics.trace.title")}
+              </span>
+              <code className="min-w-0 flex-1 break-all select-text">
+                {summary.trace_path}
+              </code>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!summary.trace_path}
+                aria-label={t("settings.statistics.trace.copyPath")}
+                onClick={() => {
+                  const copy = async () => {
+                    try {
+                      await navigator.clipboard.writeText(summary.trace_path);
+                      setCopyStatus({ kind: "copied" });
+                    } catch (error) {
+                      setCopyStatus({ kind: "error", error: String(error) });
+                    }
+                  };
+                  void copy();
+                }}
+              >
+                {t(
+                  copyStatus.kind === "copied"
+                    ? "settings.statistics.trace.copied"
+                    : "common.copy",
+                )}
+              </Button>
+            </div>
+            {summary.pending_exports > 0 && (
+              <p role="status">
+                {t("settings.statistics.trace.pending", {
+                  runs: summary.pending_exports,
+                })}
+              </p>
+            )}
+            {summary.trace_error && (
+              <p role="alert" className="text-error">
+                {t("settings.statistics.trace.error", {
+                  error: summary.trace_error,
+                })}
+              </p>
+            )}
+            {copyStatus.kind === "error" && (
+              <p role="alert" className="text-error">
+                {t("settings.statistics.trace.copyError", {
+                  error: copyStatus.error,
+                })}
+              </p>
+            )}
+          </div>
+        )}
+
         <div
           role="tabpanel"
           id={`${tabsId}-panel`}
@@ -278,6 +348,10 @@ export const StatisticsSettings: React.FC = () => {
             <p className="p-3 text-sm text-error">
               {t("settings.statistics.loadError", { error })}
             </p>
+          )}
+
+          {metricInfo && (
+            <p className="px-3 pt-2 text-xs text-ink-3">{t(metricInfo.hint)}</p>
           )}
 
           {summary && visible.length === 0 && !error && (
@@ -394,18 +468,9 @@ export const StatisticsSettings: React.FC = () => {
               <p className="px-2 pt-2 text-xs text-ink-3">
                 {t("settings.statistics.scale.hint")}
               </p>
-              {metricInfo && (
-                <p className="px-2 text-xs text-ink-3">{t(metricInfo.hint)}</p>
-              )}
               <p className="px-2 text-xs text-ink-3">
                 {t("settings.statistics.samplingHint")}
               </p>
-              {metric !== "entry_ms" &&
-                visible.some((group) => group.legacy_timing_runs > 0) && (
-                  <p className="px-2 text-xs text-ink-3">
-                    {t("settings.statistics.legacyTimingHint")}
-                  </p>
-                )}
               <p className="px-2 text-xs text-ink-3">
                 {t("settings.statistics.legend")}
               </p>

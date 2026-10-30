@@ -35,7 +35,24 @@
 // tests), but only the macOS/Windows platform modules consume all of it.
 #![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+
+use crate::managers::stats::trace::{
+    CompletionBasis, OutputFailure, OutputKind, OutputResult, OutputSettlement, UnconfirmedReason,
+};
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::managers::stats::trace::{OutputReceipt, TraceReporter};
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) struct PasteOptions {
+    pub auto_submit: bool,
+    pub auto_submit_key: crate::settings::AutoSubmitKey,
+    pub clipboard_handling: crate::settings::ClipboardHandling,
+    pub delay_after: Duration,
+    pub trace: Option<TraceReporter>,
+}
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -73,17 +90,17 @@ pub(crate) struct TxState {
     pub injected_at: Option<Instant>,
     /// The chord could not be sent; short-circuit the wait.
     pub injection_failed: bool,
+    pub delivery_failed: bool,
     /// Times at which a consumer requested the clipboard data.
-    pub receipts: Vec<Instant>,
+    pub last_receipt: Option<Instant>,
+    /// Prevent settlement while chord injection is still running.
+    pub injection_finished: bool,
+    pub settle_after: Option<Instant>,
     /// Someone else took clipboard ownership (user copied elsewhere, ...).
     pub ownership_lost: bool,
     /// A newer paste transaction settled this one early (see flush logic in
     /// the platform modules).
     pub cancelled: bool,
-    /// The post-paste Enter (auto-submit) has been sent for this transaction.
-    /// (Read on Windows; the macOS path settles via `MacPending::settled`.)
-    #[allow(dead_code)]
-    pub auto_submit_sent: bool,
     /// First post-injection receipt has been logged.
     pub logged_receipt: bool,
 }
@@ -94,17 +111,19 @@ impl TxState {
             published_at: Instant::now(),
             injected_at: None,
             injection_failed: false,
-            receipts: Vec::new(),
+            delivery_failed: false,
+            last_receipt: None,
+            injection_finished: false,
+            settle_after: None,
             ownership_lost: false,
             cancelled: false,
-            auto_submit_sent: false,
             logged_receipt: false,
         }
     }
 
     /// Records a read receipt, logging the first one that counts as evidence.
     pub fn record_receipt(&mut self, at: Instant) {
-        self.receipts.push(at);
+        self.last_receipt = Some(at);
         if !self.logged_receipt {
             if let Some(injected) = self.injected_at {
                 if at >= injected {
@@ -120,7 +139,7 @@ impl TxState {
 
     pub fn last_receipt_after_injection(&self) -> Option<Instant> {
         let injected = self.injected_at?;
-        self.receipts.iter().copied().rev().find(|t| *t >= injected)
+        self.last_receipt.filter(|t| *t >= injected)
     }
 
     pub fn any_receipt_after_injection(&self) -> bool {
@@ -137,8 +156,14 @@ pub(crate) enum WaitDecision {
 /// Pure decision: given the current transaction state, keep waiting for the
 /// target to read, or finish now. Both platform event loops call this.
 pub(crate) fn evaluate(state: &TxState, now: Instant) -> WaitDecision {
+    if !state.injection_finished {
+        return WaitDecision::KeepWaiting;
+    }
     if state.ownership_lost || state.cancelled {
         return WaitDecision::Finish;
+    }
+    if state.settle_after.is_some_and(|after| now < after) {
+        return WaitDecision::KeepWaiting;
     }
     if let Some(last) = state.last_receipt_after_injection() {
         if now.duration_since(last) >= QUIET_PERIOD {
@@ -154,6 +179,71 @@ pub(crate) fn evaluate(state: &TxState, now: Instant) -> WaitDecision {
         return WaitDecision::Finish;
     }
     WaitDecision::KeepWaiting
+}
+
+/// Owns the single notification shared by normal and superseding settlement.
+#[derive(Debug, Default)]
+pub(crate) struct Completion {
+    sender: Option<Sender<OutputSettlement>>,
+}
+
+impl Completion {
+    pub fn channel() -> (Self, Receiver<OutputSettlement>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            Self {
+                sender: Some(sender),
+            },
+            receiver,
+        )
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.sender.is_some()
+    }
+
+    pub fn settle(
+        &mut self,
+        result: OutputResult,
+        finish: impl FnOnce() -> Result<(), OutputFailure>,
+    ) {
+        self.settle_with(|| match finish() {
+            Ok(()) => result,
+            Err(failure) => OutputResult::Failed(failure),
+        });
+    }
+
+    pub fn settle_with(&mut self, finish: impl FnOnce() -> OutputResult) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let result = finish();
+        let _ = sender.send(OutputSettlement {
+            at: Instant::now(),
+            kind: OutputKind::ClipboardPaste,
+            result,
+        });
+    }
+}
+
+pub(crate) fn settlement_result(
+    state: &TxState,
+    still_ours: bool,
+    superseded: bool,
+) -> OutputResult {
+    if state.injection_failed {
+        OutputResult::Failed(OutputFailure::Injection)
+    } else if state.delivery_failed {
+        OutputResult::Failed(OutputFailure::Other)
+    } else if state.ownership_lost || !still_ours {
+        OutputResult::Unconfirmed(UnconfirmedReason::OwnershipLost)
+    } else if superseded {
+        OutputResult::Unconfirmed(UnconfirmedReason::Superseded)
+    } else if state.any_receipt_after_injection() {
+        OutputResult::Completed(CompletionBasis::ReceiptTransactionSettled)
+    } else {
+        OutputResult::Unconfirmed(UnconfirmedReason::Timeout)
+    }
 }
 
 /// Modifier hold for the receipt-sequenced chord, kept at parity with the
@@ -196,19 +286,9 @@ pub(crate) fn try_reliable_paste(
     app_handle: &tauri::AppHandle,
     paste_method: &crate::settings::PasteMethod,
     enigo: &mut enigo::Enigo,
-    auto_submit: bool,
-    auto_submit_key: crate::settings::AutoSubmitKey,
-    clipboard_handling: crate::settings::ClipboardHandling,
-) -> Result<(), String> {
-    platform::run(
-        text,
-        app_handle,
-        paste_method,
-        enigo,
-        auto_submit,
-        auto_submit_key,
-        clipboard_handling,
-    )
+    options: PasteOptions,
+) -> Result<OutputReceipt, String> {
+    platform::run(text, app_handle, paste_method, enigo, options)
 }
 
 #[cfg(test)]
@@ -218,7 +298,166 @@ mod tests {
     fn state_after_publish(published_ago: Duration) -> TxState {
         let mut s = TxState::new();
         s.published_at = Instant::now() - published_ago;
+        s.injection_finished = true;
         s
+    }
+
+    #[test]
+    fn cannot_settle_before_chord_injection_returns() {
+        let state = TxState::new();
+        assert!(matches!(
+            evaluate(&state, Instant::now() + RESTORE_TIMEOUT),
+            WaitDecision::KeepWaiting
+        ));
+    }
+
+    #[test]
+    fn confirmed_settlement_honors_configured_after_delay() {
+        let mut state = state_after_publish(Duration::from_millis(500));
+        let now = Instant::now();
+        state.injected_at = Some(state.published_at);
+        state.record_receipt(now - QUIET_PERIOD);
+        state.settle_after = Some(now + Duration::from_millis(100));
+        assert!(matches!(evaluate(&state, now), WaitDecision::KeepWaiting));
+        assert!(matches!(
+            evaluate(&state, state.settle_after.unwrap()),
+            WaitDecision::Finish
+        ));
+    }
+
+    #[test]
+    fn receipt_arrives_only_after_followup_work() {
+        let (mut completion, receiver) = Completion::channel();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let finished = std::cell::Cell::new(None);
+        completion.settle(
+            OutputResult::Completed(CompletionBasis::ReceiptTransactionSettled),
+            || {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                finished.set(Some(Instant::now()));
+                Ok(())
+            },
+        );
+        let settlement = receiver.recv().unwrap();
+        assert!(settlement.at >= finished.get().unwrap());
+        assert!(matches!(
+            settlement.result,
+            OutputResult::Completed(CompletionBasis::ReceiptTransactionSettled)
+        ));
+    }
+
+    #[test]
+    fn competing_settlement_runs_followup_exactly_once() {
+        let (mut completion, receiver) = Completion::channel();
+        let calls = std::cell::Cell::new(0);
+        completion.settle(
+            OutputResult::Unconfirmed(UnconfirmedReason::Superseded),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        completion.settle(
+            OutputResult::Completed(CompletionBasis::ReceiptTransactionSettled),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            receiver.recv().unwrap().result,
+            OutputResult::Unconfirmed(UnconfirmedReason::Superseded)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn independent_transactions_can_finish_out_of_order() {
+        let (mut first, first_receiver) = Completion::channel();
+        let (mut second, second_receiver) = Completion::channel();
+        second.settle(
+            OutputResult::Unconfirmed(UnconfirmedReason::Timeout),
+            || Ok(()),
+        );
+        assert!(second_receiver.try_recv().is_ok());
+        assert!(matches!(
+            first_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        first.settle(
+            OutputResult::Unconfirmed(UnconfirmedReason::Superseded),
+            || Ok(()),
+        );
+        assert!(matches!(
+            first_receiver.recv().unwrap().result,
+            OutputResult::Unconfirmed(UnconfirmedReason::Superseded)
+        ));
+    }
+
+    #[test]
+    fn followup_failures_prevent_successful_completion() {
+        for failure in [OutputFailure::Restore, OutputFailure::AutoSubmit] {
+            let (mut completion, receiver) = Completion::channel();
+            completion.settle(
+                OutputResult::Completed(CompletionBasis::ReceiptTransactionSettled),
+                || Err(failure),
+            );
+            assert!(matches!(
+                receiver.recv().unwrap().result,
+                OutputResult::Failed(OutputFailure::Restore | OutputFailure::AutoSubmit)
+            ));
+        }
+    }
+
+    #[test]
+    fn settlement_keeps_unconfirmed_reasons_distinct() {
+        let mut state = state_after_publish(RESTORE_TIMEOUT);
+        assert!(matches!(
+            settlement_result(&state, true, false),
+            OutputResult::Unconfirmed(UnconfirmedReason::Timeout)
+        ));
+        assert!(matches!(
+            settlement_result(&state, true, true),
+            OutputResult::Unconfirmed(UnconfirmedReason::Superseded)
+        ));
+        assert!(matches!(
+            settlement_result(&state, false, false),
+            OutputResult::Unconfirmed(UnconfirmedReason::OwnershipLost)
+        ));
+        state.injection_failed = true;
+        assert!(matches!(
+            settlement_result(&state, true, false),
+            OutputResult::Failed(OutputFailure::Injection)
+        ));
+        state.injection_failed = false;
+        state.delivery_failed = true;
+        assert!(matches!(
+            settlement_result(&state, true, false),
+            OutputResult::Failed(OutputFailure::Other)
+        ));
+    }
+
+    #[test]
+    fn read_receipt_is_required_for_confirmed_settlement() {
+        let mut state = state_after_publish(Duration::from_millis(500));
+        state.injected_at = Some(state.published_at);
+        state.record_receipt(Instant::now() - QUIET_PERIOD);
+        assert!(matches!(
+            settlement_result(&state, true, false),
+            OutputResult::Completed(CompletionBasis::ReceiptTransactionSettled)
+        ));
+        state.ownership_lost = true;
+        assert!(matches!(
+            settlement_result(&state, true, false),
+            OutputResult::Unconfirmed(UnconfirmedReason::OwnershipLost)
+        ));
     }
 
     #[test]
@@ -234,7 +473,7 @@ mod tests {
     fn finishes_after_quiet_period_once_read() {
         let mut s = state_after_publish(Duration::from_millis(300));
         s.injected_at = Some(Instant::now() - Duration::from_millis(250));
-        s.receipts.push(Instant::now() - QUIET_PERIOD);
+        s.last_receipt = Some(Instant::now() - QUIET_PERIOD);
         assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
     }
 
@@ -242,7 +481,7 @@ mod tests {
     fn waits_through_quiet_period_after_recent_read() {
         let mut s = state_after_publish(Duration::from_millis(300));
         s.injected_at = Some(Instant::now() - Duration::from_millis(100));
-        s.receipts.push(Instant::now() - Duration::from_millis(50));
+        s.last_receipt = Some(Instant::now() - Duration::from_millis(50));
         assert!(matches!(
             evaluate(&s, Instant::now()),
             WaitDecision::KeepWaiting
@@ -252,7 +491,7 @@ mod tests {
     #[test]
     fn pre_injection_receipt_does_not_count() {
         let mut s = state_after_publish(Duration::from_millis(300));
-        s.receipts.push(Instant::now() - Duration::from_millis(200));
+        s.last_receipt = Some(Instant::now() - Duration::from_millis(200));
         s.injected_at = Some(Instant::now() - Duration::from_millis(100));
         assert!(!s.any_receipt_after_injection());
         assert!(matches!(

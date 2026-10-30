@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use handy_recorder::{AudioChunk, Sink};
 
+use crate::managers::stats::trace::{CaptureEvidence, Event, TraceReporter};
+
 use crate::audio_toolkit::{
     audio::AudioVisualiser,
     constants,
@@ -70,6 +72,7 @@ pub type AudioFrameCallback = Arc<dyn Fn(&[f32]) + Send + Sync + 'static>;
 
 /// What a finished recording hands back.
 pub struct CapturedAudio {
+    trace: Option<TraceReporter>,
     /// 16 kHz mono samples that passed the VAD policy.
     pub samples: Vec<f32>,
     /// Every sample received (pre-VAD) was exactly zero, e.g. a muted mic.
@@ -79,14 +82,39 @@ pub struct CapturedAudio {
     /// or only failed: the audio kept then is not known to hold speech.
     pub speech_detected: bool,
     pub first_audio: Option<Instant>,
+    pub first_vad: Option<Instant>,
+    pub valid_frames: u64,
+    pub first_vad_range: Option<(u64, u64)>,
     /// The detector the recording borrowed, for the next one.
     pub vad: CaptureVad,
+}
+
+impl CapturedAudio {
+    /// Preserve capture evidence before a stop or cancellation discards audio.
+    pub fn publish_capture(&self, dropped_frames: u64, capture_failed: bool) -> CaptureEvidence {
+        let evidence = CaptureEvidence {
+            first_delivery: self.first_audio,
+            first_vad: self.first_vad,
+            first_vad_range: self.first_vad_range,
+            valid_frames: self.valid_frames,
+            dropped_frames,
+            capture_failed,
+            speech_detected: self.speech_detected,
+            measured: None,
+        };
+        if let Some(trace) = &self.trace {
+            trace.captured(evidence.clone());
+            trace.event(Instant::now(), Event::CaptureStopped);
+        }
+        evidence
+    }
 }
 
 /// One recording's consumer of 16 kHz mono audio from handy-recorder. Runs on
 /// the recorder's delivery thread, never the real-time audio thread, so it
 /// can run VAD inline. Chunks are exactly one VAD frame long.
 pub struct CaptureSink {
+    trace: Option<TraceReporter>,
     vad: CaptureVad,
     policy: VadPolicy,
     visualizer: AudioVisualiser,
@@ -99,6 +127,10 @@ pub struct CaptureSink {
     heard_sound: bool,
     speech_detected: bool,
     first_audio: Option<Instant>,
+    first_vad: Option<Instant>,
+    valid_frames: u64,
+    first_vad_range: Option<(u64, u64)>,
+    telemetry_enabled: bool,
 }
 
 /// Spectrum window at 16 kHz: 32 ms, near the overlay's ~30 Hz refresh.
@@ -121,6 +153,7 @@ impl CaptureSink {
             vad.detector.reset();
         }
         Self {
+            trace: None,
             vad,
             policy,
             visualizer: AudioVisualiser::new(
@@ -137,7 +170,22 @@ impl CaptureSink {
             heard_sound: false,
             speech_detected: false,
             first_audio: None,
+            first_vad: None,
+            valid_frames: 0,
+            first_vad_range: None,
+            telemetry_enabled: true,
         }
+    }
+
+    /// Attach this recording's reporter without touching it during capture.
+    pub fn with_trace(mut self, trace: Option<TraceReporter>) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn telemetry_enabled(&mut self, enabled: bool) {
+        self.telemetry_enabled = enabled;
     }
 
     /// The detector, from a sink that never recorded (its start failed).
@@ -165,11 +213,15 @@ impl CaptureSink {
             }
         }
         CapturedAudio {
+            trace: self.trace,
             samples: self.samples,
             // `ready` is spent on the first chunk, so `None` means audio came.
             input_silent: self.ready.is_none() && !self.heard_sound,
             speech_detected: self.speech_detected,
             first_audio: self.first_audio,
+            first_vad: self.first_vad,
+            valid_frames: self.valid_frames,
+            first_vad_range: self.first_vad_range,
             vad: self.vad,
         }
     }
@@ -183,6 +235,10 @@ impl CaptureSink {
 impl Sink for CaptureSink {
     fn process_chunk(&mut self, chunk: AudioChunk<'_>) {
         self.first_audio.get_or_insert_with(Instant::now);
+        let raw_first = self.valid_frames;
+        if self.telemetry_enabled {
+            self.valid_frames = self.valid_frames.saturating_add(chunk.valid_frames as u64);
+        }
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(());
         }
@@ -197,19 +253,51 @@ impl Sink for CaptureSink {
         }
 
         if self.policy == VadPolicy::Disabled {
+            if self.telemetry_enabled && self.first_vad.is_none() && !real.is_empty() {
+                self.first_vad = Some(Instant::now());
+                self.first_vad_range = Some((raw_first, real.len() as u64));
+            }
             Self::emit(&mut self.samples, &self.on_audio, real);
             return;
         }
 
         // The detector needs whole frames, so the final chunk goes in with its
         // zero padding; at most one frame of silence reaches the recording.
-        match self.vad.detector.push_frame(chunk.samples) {
-            Ok(VadFrame::Speech(frame)) => {
+        let output = if self.telemetry_enabled {
+            self.vad
+                .detector
+                .push_frame_with_range(chunk.samples, (raw_first, chunk.valid_frames as u64))
+        } else {
+            self.vad.detector.push_frame(chunk.samples).map(|frame| {
+                crate::audio_toolkit::vad::VadOutput {
+                    frame,
+                    raw_range: None,
+                }
+            })
+        };
+        match output {
+            Ok(crate::audio_toolkit::vad::VadOutput {
+                frame: VadFrame::Speech(frame),
+                raw_range,
+            }) => {
                 self.speech_detected = true;
+                if self.telemetry_enabled && self.first_vad.is_none() {
+                    self.first_vad = Some(Instant::now());
+                    self.first_vad_range = raw_range;
+                }
                 Self::emit(&mut self.samples, &self.on_audio, frame);
             }
-            Ok(VadFrame::Noise) => {}
-            Err(_) => Self::emit(&mut self.samples, &self.on_audio, chunk.samples),
+            Ok(crate::audio_toolkit::vad::VadOutput {
+                frame: VadFrame::Noise,
+                ..
+            }) => {}
+            Err(_) => {
+                if self.telemetry_enabled && self.first_vad.is_none() {
+                    self.first_vad = Some(Instant::now());
+                    self.first_vad_range = Some((raw_first, chunk.valid_frames as u64));
+                }
+                Self::emit(&mut self.samples, &self.on_audio, chunk.samples);
+            }
         }
     }
 }

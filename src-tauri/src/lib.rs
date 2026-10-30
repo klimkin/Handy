@@ -219,6 +219,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
     app_handle.manage(stats_manager);
+    app_handle.manage(TranscriptionCoordinator::new(app_handle.clone()));
     app_handle.manage(tray::TrayState::new());
     app_handle.manage(TranscriptionJobManager::new(app_handle));
 
@@ -631,34 +632,8 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
     0
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run(cli_args: CliArgs) {
-    // Avoid ggml-metal residency-set teardown assertions when a native engine
-    // outlives the Tauri shutdown sequence (#1902). This must happen before
-    // transcribe-cpp initializes its Metal device. Advanced users can restore
-    // upstream residency behavior with HANDY_METAL_RESIDENCY=1.
-    #[cfg(target_os = "macos")]
-    if std::env::var("HANDY_METAL_RESIDENCY").as_deref() == Ok("1") {
-        // ggml treats GGML_METAL_NO_RESIDENCY as presence-based, so remove an
-        // inherited value as well when explicitly opting back in.
-        std::env::remove_var("GGML_METAL_NO_RESIDENCY");
-    } else {
-        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
-    }
-
-    // Pin glibc's dynamic mmap threshold before the first large allocation,
-    // so per-dictation transient buffers are returned to the OS on free
-    // instead of accumulating in malloc arenas (#1792). No-op off Linux/glibc.
-    memory::init_allocator();
-
-    // Detect portable mode before anything else
-    portable::init();
-
-    // Parse console logging directives from RUST_LOG, falling back to info-level logging
-    // when the variable is unset
-    let console_filter = build_console_filter();
-
-    let specta_builder = Builder::<tauri::Wry>::new()
+fn bindings_builder() -> Builder<tauri::Wry> {
+    Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             shortcut::change_binding,
             shortcut::reset_binding,
@@ -799,7 +774,49 @@ pub fn run(cli_args: CliArgs) {
             managers::transcription::StreamPhaseEvent,
             transcription_coordinator::RecordingStateEvent,
             actions::TranscriptionCompleteEvent,
-        ]);
+        ])
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "regenerates frontend bindings through tauri-specta"]
+fn regenerate_bindings() {
+    bindings_builder()
+        .export(
+            Typescript::default().bigint(BigIntExportBehavior::Number),
+            "../src/bindings.ts",
+        )
+        .expect("export bindings");
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run(cli_args: CliArgs) {
+    // Avoid ggml-metal residency-set teardown assertions when a native engine
+    // outlives the Tauri shutdown sequence (#1902). This must happen before
+    // transcribe-cpp initializes its Metal device. Advanced users can restore
+    // upstream residency behavior with HANDY_METAL_RESIDENCY=1.
+    #[cfg(target_os = "macos")]
+    if std::env::var("HANDY_METAL_RESIDENCY").as_deref() == Ok("1") {
+        // ggml treats GGML_METAL_NO_RESIDENCY as presence-based, so remove an
+        // inherited value as well when explicitly opting back in.
+        std::env::remove_var("GGML_METAL_NO_RESIDENCY");
+    } else {
+        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+    }
+
+    // Pin glibc's dynamic mmap threshold before the first large allocation,
+    // so per-dictation transient buffers are returned to the OS on free
+    // instead of accumulating in malloc arenas (#1792). No-op off Linux/glibc.
+    memory::init_allocator();
+
+    // Detect portable mode before anything else
+    portable::init();
+
+    // Parse console logging directives from RUST_LOG, falling back to info-level logging
+    // when the variable is unset
+    let console_filter = build_console_filter();
+
+    let specta_builder = bindings_builder();
 
     #[cfg(debug_assertions)] // <- Only export on non-release builds
     specta_builder
@@ -1052,7 +1069,6 @@ pub fn run(cli_args: CliArgs) {
             // honors the runtime `--debug` override applied to `settings` above.
             WEBVIEW_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
             let app_handle = app.handle().clone();
-            app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
             initialize_core_logic(&app_handle);
 
@@ -1146,6 +1162,37 @@ pub fn run(cli_args: CliArgs) {
     // `app` is only used by the macOS arm.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     app.run(|app, event| match &event {
+        tauri::RunEvent::ExitRequested { api, code, .. } => {
+            static SHUTDOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+            use std::sync::atomic::Ordering;
+            if let Some(stats) = app.try_state::<Arc<StatsManager>>() {
+                if SHUTDOWN.load(Ordering::Acquire) < 2 {
+                    api.prevent_exit();
+                }
+                if SHUTDOWN
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let stats = Arc::clone(&stats);
+                    stats.stop_admissions();
+                    let app = app.clone();
+                    let code = code.unwrap_or(0);
+                    std::thread::spawn(move || {
+                        if app
+                            .try_state::<Arc<managers::audio::AudioRecordingManager>>()
+                            .is_some()
+                        {
+                            utils::cancel_current_operation(&app);
+                        }
+                        if let Err(error) = stats.shutdown() {
+                            log::warn!("Telemetry shutdown incomplete: {error}");
+                        }
+                        SHUTDOWN.store(2, Ordering::Release);
+                        app.exit(code);
+                    });
+                }
+            }
+        }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => {
             // Fired when the already-running bundle is launched again from

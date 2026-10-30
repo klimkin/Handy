@@ -866,15 +866,13 @@
     },
     "statistics": {
       "title": "Statistics",
-      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "description": "Lacunes et résultats des dictées en local.",
       "metric": {
         "label": "Metric",
-        "entry": "Entry",
-        "exit": "Exit",
-        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
-        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
-        "postProcess": "Post-processing",
-        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+        "captureGap": "Lacune de capture",
+        "outputGap": "Délai de sortie",
+        "captureGapHint": "Audio manquant après activation, avant la VAD. Sans horodatage des échantillons ou couverture continue, la valeur est inconnue, pas nulle. L’arrivée du bloc ne donne pas l’heure de capture.",
+        "outputGapHint": "De l’événement d’arrêt initial à la fin de la sortie, y compris le LLM, les délais de sortie et la restauration du presse-papiers. Cela ne prouve pas que l’application cible affiche le texte."
       },
       "sort": {
         "label": "Sort",
@@ -894,7 +892,7 @@
       },
       "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
       "failureTitle": "{{failures}} of {{runs}} runs failed",
-      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "legend": "Les moustaches indiquent le minimum et le maximum, la boîte les 50 % centraux (Q1–Q3), le trait la médiane et le losange la moyenne.",
       "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
       "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
       "loadError": "Couldn't load statistics: {{error}}",
@@ -942,10 +940,18 @@
         "paste_delay_after_ms": "Post-paste delay (ms)",
         "extra_recording_buffer_ms": "Post-stop buffer (ms)",
         "post_process_provider": "Post-processing provider",
-        "post_process_model": "Post-processing model"
+        "post_process_model": "Post-processing model",
+        "post_process_prompt_sha256": "Empreinte de l’invite",
+        "post_process_prompt": "Identifiant de l’invite",
+        "auto_submit": "Envoi automatique",
+        "auto_submit_key": "Touche d’envoi automatique",
+        "clipboard_handling": "Gestion du presse-papiers",
+        "append_trailing_space": "Ajouter une espace finale",
+        "typing_tool": "Outil de frappe",
+        "reliable_paste": "Collage fiable"
       },
       "noTiming": "No timing samples yet",
-      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "samplingHint": "Les mesures excluent les annulations. La capture peut rester valide après un échec du traitement ; la sortie exige une fin confirmée. Les annulations ne sont pas des échecs. Paramètres relevés à l’activation ; langues non détectées séparées.",
       "scale": {
         "label": "Shared scale",
         "fit": "Fit data",
@@ -955,7 +961,16 @@
         "zoomOut": "Zoom out",
         "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
       },
-      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
+      "legacyTimingHint": "{{runs}} anciennes exécutions sont conservées et exclues de ces métriques. Les nouvelles dictées fourniront de nouvelles mesures.",
+      "samples": "{{samples}} mesurées · {{missing}} indisponibles · {{cancellations}} annulées",
+      "trace": {
+        "title": "Fichier d’événements",
+        "copyPath": "Copier le chemin du fichier d’événements",
+        "copied": "Copié",
+        "pending": "Exports d’événements en attente : {{runs}}",
+        "error": "Échec de l’export des événements : {{error}}",
+        "copyError": "Impossible de copier le chemin : {{error}}"
+      }
     },
     "about": {
       "title": "À propos",

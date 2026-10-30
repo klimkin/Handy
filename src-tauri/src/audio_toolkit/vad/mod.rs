@@ -30,7 +30,22 @@ impl<'a> VadFrame<'a> {
     }
 }
 
+pub struct VadOutput<'a> {
+    pub frame: VadFrame<'a>,
+    pub raw_range: Option<(u64, u64)>,
+}
 pub trait VoiceActivityDetector: Send + Sync {
+    /// Input and output lineage use valid raw mono frame ordinals, excluding padding.
+    fn push_frame_with_range<'a>(
+        &'a mut self,
+        frame: &'a [f32],
+        _range: (u64, u64),
+    ) -> Result<VadOutput<'a>> {
+        self.push_frame(frame).map(|frame| VadOutput {
+            frame,
+            raw_range: None,
+        })
+    }
     /// Primary streaming API: feed one backend-sized frame, get a keep/drop decision.
     fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> Result<VadFrame<'a>>;
 

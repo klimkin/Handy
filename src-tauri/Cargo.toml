@@ -73,6 +73,7 @@ regex = "1"
 whatlang = "0.16"
 isolang = "2"
 chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 libc = "0.2"

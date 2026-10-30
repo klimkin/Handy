@@ -7,6 +7,9 @@ use crate::audio_toolkit::{
     CaptureSink, CaptureVad, SileroVad, SpeechScorer, VadPolicy, VoiceActivityDetector,
 };
 use crate::helpers::clamshell;
+use crate::managers::stats::trace::{
+    Event, PhaseKind, PhaseOutcome, ResourceKind, ResourceReadiness, TraceReporter,
+};
 use crate::managers::transcription::StreamRouter;
 use crate::settings::{get_settings, write_settings, AppSettings, VadBackend};
 use crate::utils;
@@ -408,15 +411,32 @@ fn microphone_config(
     }
 }
 
-fn open_microphone(config: RecorderConfig) -> Result<OpenMicrophone, handy_recorder::Error> {
+fn open_microphone(
+    config: RecorderConfig,
+    trace: Option<&TraceReporter>,
+) -> Result<OpenMicrophone, handy_recorder::Error> {
     let failed = Arc::new(AtomicBool::new(false));
-    let recorder = Recorder::open_with_failure_handler(config, {
+    let phase = trace.map(|t| t.begin(PhaseKind::MicrophoneOpen));
+    let result = Recorder::open_with_failure_handler(config, {
         let failed = Arc::clone(&failed);
         // handy-recorder logs the failure. The stream is rebuilt on the next
         // start; a recording in progress keeps the audio captured before it.
         move |_| failed.store(true, Ordering::Release)
-    })?;
-    Ok(OpenMicrophone { recorder, failed })
+    });
+    if let (Some(t), Some(id)) = (trace, phase) {
+        t.end(
+            id,
+            if result.is_ok() {
+                PhaseOutcome::Success
+            } else {
+                PhaseOutcome::Failed
+            },
+        );
+    }
+    Ok(OpenMicrophone {
+        recorder: result?,
+        failed,
+    })
 }
 
 /// Opens with the selected channel, or averages all channels if the device
@@ -425,11 +445,15 @@ fn open_microphone_on_channel(
     device: Option<String>,
     channel: Option<u16>,
     frames_per_chunk: usize,
+    trace: Option<&TraceReporter>,
 ) -> Result<OpenMicrophone, handy_recorder::Error> {
-    match open_microphone(microphone_config(device.clone(), channel, frames_per_chunk)) {
+    match open_microphone(
+        microphone_config(device.clone(), channel, frames_per_chunk),
+        trace,
+    ) {
         Err(error) if error.kind() == ErrorKind::InvalidChannel => {
             warn!("{error}; averaging all input channels instead");
-            open_microphone(microphone_config(device, None, frames_per_chunk))
+            open_microphone(microphone_config(device, None, frames_per_chunk), trace)
         }
         result => result,
     }
@@ -504,18 +528,25 @@ pub struct Recording {
     pub samples: Vec<f32>,
     /// Every sample was exactly zero, not just audio without speech.
     pub input_silent: bool,
-    /// The VAD judged some of it to be speech; false when it was off.
-    pub speech_detected: bool,
-    pub first_audio: Option<Instant>,
+    pub capture: crate::managers::stats::trace::CaptureEvidence,
 }
 
 impl Recording {
+    fn complete_stop(mut self, cancelled: bool) -> Self {
+        if cancelled {
+            debug!("Recording stop cancelled; discarding captured samples");
+            self.samples.clear();
+        } else if !self.samples.is_empty() && self.samples.len() < WHISPER_SAMPLE_RATE {
+            self.samples.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
+        }
+        self
+    }
+
     fn lost() -> Self {
         Self {
             samples: Vec::new(),
             input_silent: false,
-            speech_detected: false,
-            first_audio: None,
+            capture: crate::managers::stats::trace::CaptureEvidence::default(),
         }
     }
 }
@@ -709,10 +740,42 @@ impl AudioRecordingManager {
     /* ---------- VAD --------------------------------------------------------- */
 
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
+        self.preload_vad_traced(None)
+    }
+    pub fn preload_vad_traced(&self, trace: Option<&TraceReporter>) -> Result<(), anyhow::Error> {
         let mut vad = self.vad.lock().unwrap();
         if matches!(*vad, VadSlot::Unloaded) {
             let settings = get_settings(&self.app_handle);
-            *vad = VadSlot::Idle(create_capture_vad(settings.vad_backend, &self.app_handle)?);
+            if let Some(t) = trace {
+                t.event(
+                    Instant::now(),
+                    Event::ResourceState {
+                        resource: ResourceKind::Vad,
+                        state: ResourceReadiness::Cold,
+                    },
+                );
+            }
+            let phase = trace.map(|t| t.begin(PhaseKind::VadPrepare));
+            let result = create_capture_vad(settings.vad_backend, &self.app_handle);
+            if let (Some(t), Some(id)) = (trace, phase) {
+                t.end(
+                    id,
+                    if result.is_ok() {
+                        PhaseOutcome::Success
+                    } else {
+                        PhaseOutcome::Failed
+                    },
+                );
+            }
+            *vad = VadSlot::Idle(result?);
+        } else if let Some(t) = trace {
+            t.event(
+                Instant::now(),
+                Event::ResourceState {
+                    resource: ResourceKind::Vad,
+                    state: ResourceReadiness::Ready,
+                },
+            );
         }
         Ok(())
     }
@@ -801,6 +864,12 @@ impl AudioRecordingManager {
     }
 
     pub fn start_microphone_stream(&self) -> Result<(), anyhow::Error> {
+        self.start_microphone_stream_traced(None)
+    }
+    fn start_microphone_stream_traced(
+        &self,
+        trace: Option<&TraceReporter>,
+    ) -> Result<(), anyhow::Error> {
         let mut open_flag = self.is_open.lock().unwrap();
         if *open_flag {
             // `is_open` only records that we opened a stream, not that it is
@@ -819,6 +888,15 @@ impl AudioRecordingManager {
                 // try_start_recording this now fires on every keypress in
                 // always-on mode.
                 trace!("Microphone stream already active");
+                if let Some(t) = trace {
+                    t.event(
+                        Instant::now(),
+                        Event::ResourceState {
+                            resource: ResourceKind::Microphone,
+                            state: ResourceReadiness::Ready,
+                        },
+                    );
+                }
                 return Ok(());
             }
 
@@ -844,6 +922,15 @@ impl AudioRecordingManager {
         }
 
         let start_time = Instant::now();
+        if let Some(t) = trace {
+            t.event(
+                start_time,
+                Event::ResourceState {
+                    resource: ResourceKind::Microphone,
+                    state: ResourceReadiness::Cold,
+                },
+            );
+        }
 
         // Don't mute immediately - caller will handle muting after audio feedback.
         // The previous stream restored audio on close, so did_mute should already
@@ -869,6 +956,7 @@ impl AudioRecordingManager {
         // Ensure VAD is loaded if it wasn't for whatever reason; its frame
         // size is the chunk size.
         let vad_started = Instant::now();
+        self.preload_vad_traced(trace)?;
         let frames_per_chunk = self.vad_frame_samples()?;
         let vad_elapsed = vad_started.elapsed();
 
@@ -878,6 +966,7 @@ impl AudioRecordingManager {
             resolution.device.clone(),
             channel,
             frames_per_chunk,
+            trace,
         ) {
             Err(first_err) if resolution.from_cache => {
                 // The cached device ID may have gone stale (unplugged).
@@ -886,7 +975,12 @@ impl AudioRecordingManager {
                 warn!("Recorder open failed ({first_err}); re-resolving device and retrying once");
                 self.invalidate_device_cache();
                 resolution = self.resolve_microphone_device(&settings);
-                open_microphone_on_channel(resolution.device.clone(), channel, frames_per_chunk)
+                open_microphone_on_channel(
+                    resolution.device.clone(),
+                    channel,
+                    frames_per_chunk,
+                    trace,
+                )
             }
             result => result,
         }?;
@@ -972,12 +1066,15 @@ impl AudioRecordingManager {
                     );
                 }
                 let captured = stopped.sink.finish();
+                let capture = captured.publish_capture(
+                    stopped.dropped_frames,
+                    !matches!(stopped.end_reason, EndReason::StopCalled),
+                );
                 self.return_vad(captured.vad);
                 Recording {
                     samples: captured.samples,
                     input_silent: captured.input_silent,
-                    speech_detected: captured.speech_detected,
-                    first_audio: captured.first_audio,
+                    capture,
                 }
             }
             Err(e) => {
@@ -1036,6 +1133,7 @@ impl AudioRecordingManager {
         &self,
         binding_id: &str,
         vad_policy: VadPolicy,
+        trace: Option<&TraceReporter>,
     ) -> Result<RecordingReadiness, anyhow::Error> {
         let mut state = self.state.lock().unwrap();
         if !matches!(*state, RecordingState::Idle) {
@@ -1054,7 +1152,7 @@ impl AudioRecordingManager {
             // is normally already open and this is a cheap aliveness check —
             // but if the recorder failed (device disconnect), it rebuilds the
             // stream instead of leaving every subsequent start wedged.
-            if let Err(e) = self.start_microphone_stream() {
+            if let Err(e) = self.start_microphone_stream_traced(trace) {
                 error!("Failed to open microphone stream: {e}");
                 return Err(e);
             }
@@ -1066,7 +1164,8 @@ impl AudioRecordingManager {
                 Arc::clone(&self.on_levels),
                 Arc::clone(&self.on_audio),
                 ready_tx,
-            );
+            )
+            .with_trace(trace.cloned());
 
             let recorder = self.recorder.lock().unwrap();
             let Some(microphone) = recorder.as_ref() else {
@@ -1242,7 +1341,7 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let mut recording = match self.recorder.lock().unwrap().as_ref() {
+                let recording = match self.recorder.lock().unwrap().as_ref() {
                     Some(microphone) => self.collect_recording(microphone),
                     None => {
                         error!("Recorder not available");
@@ -1262,17 +1361,7 @@ impl AudioRecordingManager {
                     }
                 }
 
-                if self.was_cancelled_since(cancel_generation) {
-                    debug!("Recording stop cancelled; discarding captured samples");
-                    return None;
-                }
-
-                // Pad if very short
-                let s_len = recording.samples.len();
-                if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
-                    recording.samples.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                }
-                Some(recording)
+                Some(recording.complete_stop(self.was_cancelled_since(cancel_generation)))
             }
             _ => None,
         }
@@ -1287,19 +1376,20 @@ impl AudioRecordingManager {
     }
 
     /// Cancel any ongoing recording without returning audio samples
-    pub fn cancel_recording(&self) {
+    pub fn cancel_recording(&self) -> Option<crate::managers::stats::trace::CaptureEvidence> {
+        let mut capture = None;
         self.invalidate_recording_readiness();
         self.cancel_generation.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.lock().unwrap();
 
         match *state {
             RecordingState::Recording { .. } => {
+                // A stop worker must not finalize before this drain publishes capture evidence.
+                if let Some(microphone) = self.recorder.lock().unwrap().as_ref() {
+                    capture = Some(self.collect_recording(microphone).capture);
+                }
                 self.set_state(&mut state, RecordingState::Idle);
                 drop(state);
-
-                if let Some(microphone) = self.recorder.lock().unwrap().as_ref() {
-                    let _ = self.collect_recording(microphone); // Discard the result
-                }
 
                 *self.is_recording.lock().unwrap() = false;
 
@@ -1317,6 +1407,7 @@ impl AudioRecordingManager {
             }
             RecordingState::Idle => {}
         }
+        capture
     }
 }
 
@@ -1335,6 +1426,51 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("a 0 Hz output rate should be rejected"),
         }
+    }
+
+    #[test]
+    fn cancelled_tail_completion_preserves_capture_in_terminal_trace() {
+        use crate::managers::stats::trace::{
+            CaptureEvidence, InputOrigin, InputStamp, TerminalOutcome,
+        };
+        use crate::managers::stats::StatsManager;
+        let dir = tempfile::tempdir().unwrap();
+        let stats = Arc::new(StatsManager::test_at(dir.path().join("stats.db")));
+        let activation = Instant::now();
+        let mut run = stats.begin(
+            InputStamp::at(activation, InputOrigin::ShortcutCallback),
+            Default::default(),
+        );
+        let recording = Recording {
+            samples: vec![0.5; 480],
+            input_silent: false,
+            capture: CaptureEvidence {
+                first_delivery: Some(activation + Duration::from_millis(20)),
+                valid_frames: 480,
+                dropped_frames: 24,
+                speech_detected: true,
+                ..Default::default()
+            },
+        }
+        .complete_stop(true);
+        assert!(recording.samples.is_empty());
+        run.captured(recording.capture);
+        run.finish(
+            TerminalOutcome::Cancelled,
+            activation + Duration::from_millis(40),
+            None,
+        );
+        stats.shutdown().unwrap();
+        let json = std::fs::read_to_string(stats.trace_path()).unwrap();
+        let trace: crate::managers::stats::trace::FinalizedTrace =
+            serde_json::from_str(json.trim()).unwrap();
+        assert!(matches!(trace.outcome, TerminalOutcome::Cancelled));
+        assert_eq!(trace.capture.first_delivery_us, Some(20_000));
+        assert_eq!(trace.capture.valid_frames, 480);
+        assert_eq!(trace.capture.dropped_frames, 24);
+        assert!(trace.capture.speech_detected);
+        assert!(trace.metrics.output_gap.us.is_none());
+        assert!(trace.output.is_none());
     }
 
     #[test]

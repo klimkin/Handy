@@ -2,19 +2,14 @@ import type { BoxStats, StatsGroup } from "@/bindings";
 
 export const METRICS = [
   {
-    value: "entry_ms",
-    label: "settings.statistics.metric.entry",
-    hint: "settings.statistics.metric.entryHint",
+    value: "capture_gap_ms",
+    label: "settings.statistics.metric.captureGap",
+    hint: "settings.statistics.metric.captureGapHint",
   },
   {
-    value: "exit_ms",
-    label: "settings.statistics.metric.exit",
-    hint: "settings.statistics.metric.exitHint",
-  },
-  {
-    value: "post_process_ms",
-    label: "settings.statistics.metric.postProcess",
-    hint: "settings.statistics.metric.postProcessHint",
+    value: "output_gap_ms",
+    label: "settings.statistics.metric.outputGap",
+    hint: "settings.statistics.metric.outputGapHint",
   },
 ] as const;
 export type Metric = (typeof METRICS)[number]["value"];
@@ -23,8 +18,14 @@ export type SortBy = "speed" | "failures";
 export const boxOf = (group: StatsGroup, metric: Metric): BoxStats | null =>
   group[metric];
 
+export const eligibleRuns = (group: StatsGroup): number =>
+  group.runs - group.cancellations;
+
+export const missingSamples = (group: StatsGroup, metric: Metric): number =>
+  metric === "capture_gap_ms" ? group.capture_missing : group.output_missing;
+
 export const failureRate = (group: StatsGroup): number =>
-  group.runs === 0 ? 0 : group.failures / group.runs;
+  eligibleRuns(group) === 0 ? 0 : group.failures / eligibleRuns(group);
 
 export function sortGroups(
   groups: StatsGroup[],

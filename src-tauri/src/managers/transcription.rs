@@ -14,6 +14,9 @@ use crate::language_detection::{
 };
 use crate::managers::audio::{create_smoothed_detector, AudioRecordingManager};
 use crate::managers::model::ModelManager;
+use crate::managers::stats::trace::{
+    Event, PhaseKind, PhaseOutcome, ResourceKind, ResourceReadiness, TraceReporter,
+};
 use crate::settings::{
     get_settings, AppSettings, ChineseScript, ModelUnloadTimeout, TranscribeAcceleratorSetting,
 };
@@ -30,7 +33,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_specta::Event;
+use tauri_specta::Event as _;
 use transcribe_cpp::{Backend, RunOptions, Task, Transcript};
 
 mod chunked;
@@ -685,16 +688,46 @@ impl TranscriptionManager {
 
     /// Kicks off the model loading in a background thread if it's not already loaded
     pub fn initiate_model_load(&self) {
+        self.initiate_model_load_traced(None);
+    }
+    pub fn initiate_model_load_traced(&self, trace: Option<TraceReporter>) {
         let mut is_loading = self.is_loading.lock().unwrap();
         if *is_loading {
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::ResourceState {
+                        resource: ResourceKind::Model,
+                        state: ResourceReadiness::Loading,
+                    },
+                );
+            }
             return;
         }
 
         let reload_pending = self.reload_model_on_next_use.load(Ordering::Acquire);
         if !reload_pending && self.is_model_loaded() {
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::ResourceState {
+                        resource: ResourceKind::Model,
+                        state: ResourceReadiness::Ready,
+                    },
+                );
+            }
             return;
         }
 
+        if let Some(t) = &trace {
+            t.event(
+                Instant::now(),
+                Event::ResourceState {
+                    resource: ResourceKind::Model,
+                    state: ResourceReadiness::Cold,
+                },
+            );
+        }
         *is_loading = true;
         let self_clone = self.clone();
         thread::spawn(move || {
@@ -704,7 +737,19 @@ impl TranscriptionManager {
                     .store(false, Ordering::Release);
             }
             let settings = get_settings(&self_clone.app_handle);
-            if let Err(e) = self_clone.load_model(&settings.selected_model) {
+            let phase = trace.as_ref().map(|t| t.begin(PhaseKind::ModelLoad));
+            let result = self_clone.load_model(&settings.selected_model);
+            if let (Some(t), Some(id)) = (&trace, phase) {
+                t.end(
+                    id,
+                    if result.is_ok() {
+                        PhaseOutcome::Success
+                    } else {
+                        PhaseOutcome::Failed
+                    },
+                );
+            }
+            if let Err(e) = result {
                 error!("Failed to load model: {}", e);
             }
             let mut is_loading = self_clone.is_loading.lock().unwrap();
@@ -765,7 +810,7 @@ impl TranscriptionManager {
     /// worker idles until finalize/cancel and reports `None` so the caller
     /// falls back to batch transcription. Frames sent before the decode begins
     /// queue on the channel and are not lost.
-    pub fn start_stream(&self) {
+    pub fn start_stream_traced(&self, trace: Option<TraceReporter>) {
         if self.router.is_open() || self.active_stream_worker.load(Ordering::Acquire) != 0 {
             warn!("start_stream called while a stream worker is already active");
             return;
@@ -783,7 +828,7 @@ impl TranscriptionManager {
         self.stream_active.store(false, Ordering::Release);
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, cancelled, worker_id));
+        thread::spawn(move || manager.run_stream_worker(rx, cancelled, worker_id, trace));
     }
 
     fn run_stream_worker(
@@ -791,6 +836,7 @@ impl TranscriptionManager {
         rx: mpsc::Receiver<StreamCmd>,
         cancelled: Arc<AtomicBool>,
         worker_id: u64,
+        trace: Option<TraceReporter>,
     ) {
         let _worker = StreamWorkerGuard {
             worker_id,
@@ -836,12 +882,16 @@ impl TranscriptionManager {
             ModelTraits::of(&info),
             get_settings(&self.app_handle).long_form_chunking,
         );
+        let live_started = Instant::now();
         let Some(mut session) = LiveSession::begin(self, mode, &info, &model_id) else {
             // Nothing to decode live: the recording is transcribed in batch.
             self.router.clear();
             drain_until_finalize(rx);
             return;
         };
+        let live_phase = trace
+            .as_ref()
+            .map(|t| t.begin_at(PhaseKind::LiveAsr, live_started));
         self.touch_activity();
 
         while let Ok(cmd) = rx.recv() {
@@ -855,12 +905,35 @@ impl TranscriptionManager {
                     session.feed(pcm);
                 }
                 StreamCmd::Finalize { reply, samples } => {
-                    let _ = reply.send(session.finish(samples));
+                    let phase = trace.as_ref().map(|t| t.begin(PhaseKind::LiveFinalize));
+                    let result = session.finish(samples);
+                    if let Some(t) = &trace {
+                        let outcome = if result.is_ok() {
+                            PhaseOutcome::Success
+                        } else {
+                            PhaseOutcome::Failed
+                        };
+                        if let Some(id) = phase {
+                            t.end(id, outcome);
+                        }
+                        if let Some(id) = live_phase {
+                            t.end(id, outcome);
+                        }
+                    }
+                    let _ = reply.send(result);
                     return;
                 }
                 // Dropping the session resets the worker's stream.
-                StreamCmd::Cancel => return,
+                StreamCmd::Cancel => {
+                    if let (Some(t), Some(id)) = (&trace, live_phase) {
+                        t.end(id, PhaseOutcome::Cancelled);
+                    }
+                    return;
+                }
             }
+        }
+        if let (Some(t), Some(id)) = (&trace, live_phase) {
+            t.end(id, PhaseOutcome::Cancelled);
         }
         // The channel closed without finalize/cancel; dropping the session
         // resets the worker's stream. `_worker` drops after, clearing this
@@ -925,15 +998,25 @@ impl TranscriptionManager {
     /// Transcribe a whole clip in batch: a re-transcribed history entry, or
     /// a file from the CLI.
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
-        Ok(self.complete(Instant::now(), audio, None)?.text)
+        Ok(self.complete(Instant::now(), audio, None, None)?.text)
     }
 
     /// Transcribe a finished recording: what its live decode produced, or a
     /// batch run of the whole recording when there is no live result.
-    pub fn transcribe_recording(&self, samples: Vec<f32>) -> Result<Transcription> {
+    pub fn transcribe_recording_traced(
+        &self,
+        samples: Vec<f32>,
+        trace: Option<TraceReporter>,
+    ) -> Result<Transcription> {
         let started = Instant::now();
+        let had_live = self.router.is_open();
         let live = self.finalize_live(samples.len())?;
-        self.complete(started, samples, live)
+        if had_live && live.is_none() {
+            if let Some(t) = &trace {
+                t.event(Instant::now(), Event::AsrFallback);
+            }
+        }
+        self.complete(started, samples, live, trace)
     }
 
     /// The final text of one transcription, from its live result or else a
@@ -943,6 +1026,7 @@ impl TranscriptionManager {
         started: Instant,
         audio: Vec<f32>,
         live: Option<RunOutcome>,
+        trace: Option<TraceReporter>,
     ) -> Result<Transcription> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
@@ -965,7 +1049,21 @@ impl TranscriptionManager {
 
         let outcome = match live {
             Some(outcome) => outcome,
-            None => self.decode_batch(audio)?,
+            None => {
+                let phase = trace.as_ref().map(|t| t.begin(PhaseKind::BatchAsr));
+                let result = self.decode_batch(audio);
+                if let (Some(t), Some(id)) = (&trace, phase) {
+                    t.end(
+                        id,
+                        if result.is_ok() {
+                            PhaseOutcome::Success
+                        } else {
+                            PhaseOutcome::Failed
+                        },
+                    );
+                }
+                result?
+            }
         };
         let settings = get_settings(&self.app_handle);
         let language = outcome

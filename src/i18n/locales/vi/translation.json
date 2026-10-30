@@ -866,15 +866,13 @@
     },
     "statistics": {
       "title": "Statistics",
-      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "description": "Khoảng trễ và kết quả đọc chính tả cục bộ.",
       "metric": {
         "label": "Metric",
-        "entry": "Entry",
-        "exit": "Exit",
-        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
-        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
-        "postProcess": "Post-processing",
-        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+        "captureGap": "Khoảng thiếu thu âm",
+        "outputGap": "Độ trễ đầu ra",
+        "captureGapHint": "Âm thanh bị mất sau khi kích hoạt, trước VAD. Thiếu dấu thời gian mẫu hoặc độ phủ liên tục nghĩa là chưa biết, không phải bằng không. Thời điểm khối đến không phải thời điểm thu mẫu.",
+        "outputGapHint": "Từ tín hiệu dừng ban đầu đến khi hoàn tất đầu ra, gồm LLM, độ trễ và khôi phục bảng nhớ tạm. Hoàn tất không chứng minh ứng dụng đích đã hiển thị văn bản."
       },
       "sort": {
         "label": "Sort",
@@ -894,7 +892,7 @@
       },
       "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
       "failureTitle": "{{failures}} of {{runs}} runs failed",
-      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "legend": "Râu biểu thị giá trị nhỏ nhất và lớn nhất, hộp biểu thị 50% ở giữa (Q1–Q3), đường biểu thị trung vị và hình thoi biểu thị trung bình.",
       "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
       "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
       "loadError": "Couldn't load statistics: {{error}}",
@@ -942,10 +940,18 @@
         "paste_delay_after_ms": "Post-paste delay (ms)",
         "extra_recording_buffer_ms": "Post-stop buffer (ms)",
         "post_process_provider": "Post-processing provider",
-        "post_process_model": "Post-processing model"
+        "post_process_model": "Post-processing model",
+        "post_process_prompt_sha256": "Dấu vân tay lời nhắc",
+        "post_process_prompt": "Mã lời nhắc",
+        "auto_submit": "Gửi tự động",
+        "auto_submit_key": "Phím gửi tự động",
+        "clipboard_handling": "Xử lý Clipboard",
+        "append_trailing_space": "Thêm dấu cách cuối",
+        "typing_tool": "Công cụ gõ",
+        "reliable_paste": "Dán đáng tin cậy"
       },
       "noTiming": "No timing samples yet",
-      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "samplingHint": "Phép đo loại trừ lượt hủy. Thu âm vẫn có thể hợp lệ sau lỗi xử lý; đầu ra cần xác nhận hoàn tất. Hủy không tính là lỗi. Cài đặt ghi lúc kích hoạt; ngôn ngữ chưa nhận diện được tách riêng.",
       "scale": {
         "label": "Shared scale",
         "fit": "Fit data",
@@ -955,7 +961,16 @@
         "zoomOut": "Zoom out",
         "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
       },
-      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
+      "legacyTimingHint": "Giữ lại {{runs}} lượt cũ và loại khỏi các chỉ số này. Lượt đọc mới sẽ cung cấp phép đo mới.",
+      "samples": "{{samples}} đo được · {{missing}} không có · {{cancellations}} đã hủy",
+      "trace": {
+        "title": "Tệp sự kiện",
+        "copyPath": "Sao chép đường dẫn tệp sự kiện",
+        "copied": "Đã sao chép",
+        "pending": "Lượt xuất sự kiện đang chờ: {{runs}}",
+        "error": "Xuất sự kiện thất bại: {{error}}",
+        "copyError": "Không thể sao chép đường dẫn: {{error}}"
+      }
     },
     "about": {
       "title": "Giới thiệu",

@@ -1420,34 +1420,8 @@ export type ShortcutActivation =
 "hold_or_toggle"
 export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }
 export type SoundTheme = "marimba" | "pop" | "custom"
-export type StatsGroup = {
-  model: string;
-  language: string | null;
-  variant: number;
-  config: Partial<{ [key in string]: string }>;
-  is_current: boolean;
-  runs: number;
-  failures: number;
-  first_run: number;
-  last_run: number;
-  /**
-   * Key press to first captured audio, including runs where later processing failed.
-   */
-  entry_ms: BoxStats | null;
-  /**
-   * Stop key edge to completed output minus post-processing, successful runs only.
-   */
-  exit_ms: BoxStats | null;
-  /**
-   * Actual post-processing attempts, including failed attempts.
-   */
-  post_process_ms: BoxStats | null;
-  /**
-   * Older runs whose inclusive Exit cannot be separated retrospectively.
-   */
-  legacy_timing_runs: number;
-};
-export type StatsSummary = { current: Partial<{ [key in string]: string }>; groups: StatsGroup[] }
+export type StatsGroup = { model: string; language: string | null; variant: number; config: Partial<{ [key in string]: string }>; is_current: boolean; runs: number; failures: number; cancellations: number; first_run: number; last_run: number; capture_gap_ms: BoxStats | null; output_gap_ms: BoxStats | null; capture_missing: number; output_missing: number; capture_unavailable_reasons: Partial<{ [key in string]: number }>; output_unavailable_reasons: Partial<{ [key in string]: number }> }
+export type StatsSummary = { current: Partial<{ [key in string]: string }>; groups: StatsGroup[]; legacy_runs: number; trace_path: string; trace_error: string | null; pending_exports: number }
 /**
  * Phase of the streaming overlay card, emitted to drive its UI state.
  */

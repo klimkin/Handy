@@ -1,4 +1,4 @@
-use crate::managers::stats::{config_snapshot, StatsManager, StatsSummary};
+use crate::managers::stats::{requested_config, StatsManager, StatsSummary};
 use crate::settings::get_settings;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -12,7 +12,7 @@ pub async fn get_stats_summary(
     stats: State<'_, Arc<StatsManager>>,
 ) -> Result<StatsSummary, String> {
     let settings = get_settings(&app);
-    let current = config_snapshot(&settings, &settings.selected_model);
+    let current = requested_config(&settings, &settings.selected_model, false);
     let stats = Arc::clone(&stats);
     tauri::async_runtime::spawn_blocking(move || stats.summary(current))
         .await

@@ -866,15 +866,13 @@
     },
     "statistics": {
       "title": "Statistics",
-      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "description": "Jeda dan hasil dikte lokal.",
       "metric": {
         "label": "Metric",
-        "entry": "Entry",
-        "exit": "Exit",
-        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
-        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
-        "postProcess": "Post-processing",
-        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+        "captureGap": "Celah tangkapan",
+        "outputGap": "Jeda keluaran",
+        "captureGapHint": "Audio yang hilang setelah aktivasi, sebelum VAD. Tanpa stempel waktu sampel atau cakupan berkelanjutan, nilainya tidak diketahui, bukan nol. Waktu kedatangan blok bukan waktu pengambilan sampel.",
+        "outputGapHint": "Dari sinyal berhenti asli hingga keluaran selesai, termasuk LLM, jeda keluaran, dan pemulihan papan klip. Selesai tidak membuktikan aplikasi tujuan telah menampilkan teks."
       },
       "sort": {
         "label": "Sort",
@@ -894,7 +892,7 @@
       },
       "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
       "failureTitle": "{{failures}} of {{runs}} runs failed",
-      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "legend": "Kumis menunjukkan minimum dan maksimum, kotak menunjukkan 50% tengah (Q1–Q3), garis menunjukkan median, dan wajik menunjukkan rata-rata.",
       "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
       "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
       "loadError": "Couldn't load statistics: {{error}}",
@@ -942,10 +940,18 @@
         "paste_delay_after_ms": "Post-paste delay (ms)",
         "extra_recording_buffer_ms": "Post-stop buffer (ms)",
         "post_process_provider": "Post-processing provider",
-        "post_process_model": "Post-processing model"
+        "post_process_model": "Post-processing model",
+        "post_process_prompt_sha256": "Sidik jari perintah",
+        "post_process_prompt": "ID perintah",
+        "auto_submit": "Kirim Otomatis",
+        "auto_submit_key": "Tombol kirim otomatis",
+        "clipboard_handling": "Penanganan Papan Klip",
+        "append_trailing_space": "Tambahkan Spasi di Akhir",
+        "typing_tool": "Alat Pengetikan",
+        "reliable_paste": "Tempel Lebih Andal"
       },
       "noTiming": "No timing samples yet",
-      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "samplingHint": "Pengukuran mengecualikan pembatalan. Tangkapan dapat tetap valid setelah pemrosesan gagal; keluaran memerlukan penyelesaian terkonfirmasi. Pembatalan bukan kegagalan. Pengaturan dicatat saat aktivasi; bahasa tak terdeteksi dipisahkan.",
       "scale": {
         "label": "Shared scale",
         "fit": "Fit data",
@@ -955,7 +961,16 @@
         "zoomOut": "Zoom out",
         "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
       },
-      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
+      "legacyTimingHint": "{{runs}} proses lama disimpan dan dikecualikan dari metrik ini. Dikte baru akan memberikan pengukuran baru.",
+      "samples": "{{samples}} terukur · {{missing}} tidak tersedia · {{cancellations}} dibatalkan",
+      "trace": {
+        "title": "Berkas peristiwa",
+        "copyPath": "Salin jalur berkas peristiwa",
+        "copied": "Disalin",
+        "pending": "Ekspor peristiwa tertunda: {{runs}}",
+        "error": "Ekspor peristiwa gagal: {{error}}",
+        "copyError": "Gagal menyalin jalur: {{error}}"
+      }
     },
     "about": {
       "title": "Tentang",

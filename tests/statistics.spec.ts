@@ -1,7 +1,11 @@
 import { expect, test } from "@playwright/test";
 import type { BoxStats, StatsGroup, StatsSummary } from "../src/bindings";
 
-const current = { model: "model-fast", accelerator: "gpu" };
+const current = {
+  model: "model-fast",
+  accelerator: "gpu",
+  post_process: "false",
+};
 const box = (median: number): BoxStats => ({
   min: median / 2,
   q1: median * 0.75,
@@ -19,27 +23,47 @@ const group = (
   model,
   language,
   variant: 1,
-  config: { model, accelerator: model === current.model ? "gpu" : "cpu" },
+  config: {
+    model,
+    accelerator: model === current.model ? "gpu" : "cpu",
+    post_process: model === "model-slow" ? "true" : "false",
+    ...(model === "model-slow"
+      ? {
+          post_process_provider: "local",
+          post_process_model: "llm",
+          post_process_prompt_sha256: "abc123",
+        }
+      : {}),
+  },
   is_current: model === current.model,
   runs: 10,
   failures,
   first_run: 1_793_260_800,
   last_run: 1_793_264_400,
-  entry_ms: box(model === "model-fast" ? 100 : 50),
-  exit_ms: box(median * 10_000),
-  post_process_ms: model === "model-slow" ? box(300) : null,
-  legacy_timing_runs: 0,
+  capture_gap_ms: box(model === "model-fast" ? 100 : 50),
+  output_gap_ms: box(median * 10_000),
+  capture_missing: 0,
+  output_missing: failures,
+  cancellations: 0,
+  capture_unavailable_reasons: {},
+  output_unavailable_reasons: {},
 });
 
 const summary: StatsSummary = {
   current,
+  legacy_runs: 3,
+  trace_path: "/data/telemetry/dictation-events.jsonl",
+  trace_error: null,
+  pending_exports: 0,
   groups: [
     group("model-slow", "ru", 0.4, 0),
     group("model-fast", "en", 0.1, 2),
     {
       ...group("model-failed", null, 0, 10),
-      entry_ms: null,
-      exit_ms: null,
+      capture_gap_ms: null,
+      output_gap_ms: null,
+      capture_missing: 10,
+      capture_unavailable_reasons: { sample_timestamps_unavailable: 10 },
     },
   ],
 };
@@ -114,10 +138,10 @@ test("plots arriving after load have a shared responsive scale and show configur
   await expect(
     slow.getByRole("row", { name: "Accelerator cpu gpu" }),
   ).toBeVisible();
-  await page.getByRole("tab", { name: "Entry", exact: true }).click();
+  await page.getByRole("tab", { name: "Capture gap", exact: true }).click();
   await expect(rows.first()).toContainText("model-slow");
   await expect(rows.first()).toContainText("50 ms");
-  await page.getByRole("tab", { name: "Exit", exact: true }).click();
+  await page.getByRole("tab", { name: "Output gap", exact: true }).click();
   await expect(rows.first()).toContainText("1.0 s");
   await page.getByRole("button", { name: "Fewest failures first" }).click();
   await expect(rows.first()).toContainText("model-slow");
@@ -165,7 +189,7 @@ test("failed groups have no invented timing and command errors appear on the pag
   const failed = page.getByRole("listitem").filter({ hasText: "model-failed" });
   await expect(failed).toContainText("100%");
   await expect(failed.getByRole("img")).toHaveAccessibleName(
-    "No timing samples yet",
+    /No timing samples yet/,
   );
   await expect(failed.locator("svg rect")).toHaveCount(0);
   await page.evaluate(() => {
@@ -209,7 +233,8 @@ test("fit data expands nearby points without clipping and keeps narrow-axis labe
         ...group,
         runs: 2,
         failures: 1,
-        exit_ms: {
+        output_missing: 1,
+        output_gap_ms: {
           min: value,
           q1: value,
           median: value,
@@ -281,7 +306,7 @@ test("fit data expands nearby points without clipping and keeps narrow-axis labe
     });
   expect(singlePosition).toBeGreaterThan(0.1);
   expect(singlePosition).toBeLessThan(0.9);
-  await page.getByRole("tab", { name: "Entry", exact: true }).click();
+  await page.getByRole("tab", { name: "Capture gap", exact: true }).click();
   await expect(axis.locator("text").first()).toContainText("ms");
   expect(
     parseFloat((await axis.locator("text").first().textContent()) ?? ""),
@@ -291,43 +316,168 @@ test("fit data expands nearby points without clipping and keeps narrow-axis labe
   ).toBeGreaterThanOrEqual(100);
 });
 
-test("three latency tabs expose measured post-processing and explain unsplittable history", async ({
+test("two gap tabs explain evidence, LLM configurations, missing samples and cancellations", async ({
   page,
 }, testInfo) => {
-  await expect(page.getByRole("tab")).toHaveCount(3);
-  const exit = page.getByRole("tab", { name: "Exit", exact: true });
-  await exit.focus();
+  await expect(page.getByRole("tab")).toHaveCount(2);
+  const output = page.getByRole("tab", { name: "Output gap", exact: true });
+  await output.focus();
   await page.keyboard.press("ArrowRight");
   await expect(
-    page.getByRole("tab", { name: "Post-processing", exact: true }),
+    page.getByRole("tab", { name: "Capture gap", exact: true }),
   ).toHaveAttribute("aria-selected", "true");
-  const rows = page.getByRole("listitem");
-  await expect(rows.first()).toContainText("model-slow");
-  await expect(rows.first()).toContainText("300 ms");
+  await expect(
+    page.getByText(/Sample timestamps or continuous coverage unavailable/),
+  ).toBeVisible();
+  const failed = page.getByRole("listitem").filter({ hasText: "model-failed" });
+  await expect(failed).toContainText(
+    "0 measured · 10 unavailable · 0 cancelled",
+  );
+  await expect(failed.getByRole("img")).toHaveAccessibleName(
+    /No timing samples yet.*10 unavailable/,
+  );
   await page.screenshot({
-    path: testInfo.outputPath("statistics-post-processing.png"),
+    path: testInfo.outputPath("statistics-capture-unavailable.png"),
     fullPage: true,
   });
+  await output.click();
+  await expect(page.getByText(/including LLM post-processing/)).toBeVisible();
+  const slow = page.getByRole("listitem").filter({ hasText: "model-slow" });
+  await slow.getByRole("button", { name: /model-slow/ }).dblclick();
   await expect(
-    rows.filter({ hasText: "model-fast" }).getByRole("img"),
-  ).toHaveAccessibleName("No timing samples yet");
-  await page.getByRole("button", { name: "All languages" }).click();
-  await page.getByRole("button", { name: "English", exact: true }).click();
+    slow.getByRole("row", { name: "Post-processing On Off" }),
+  ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Zoom in", exact: true }),
-  ).toBeDisabled();
-  await expect(rows.first().locator("svg rect")).toHaveCount(0);
-  await page.keyboard.press("Escape");
+    slow.getByRole("row", { name: /Prompt fingerprint abc123/ }),
+  ).toBeVisible();
   await page.evaluate(() => {
     const state = (
       window as unknown as { statisticsFixture: { summary: StatsSummary } }
     ).statisticsFixture;
-    state.summary.groups[1].legacy_timing_runs = 2;
+    state.summary.groups = [
+      {
+        ...state.summary.groups[2],
+        runs: 15,
+        failures: 2,
+        cancellations: 5,
+        capture_missing: 10,
+        output_missing: 10,
+      },
+    ];
   });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
-  await expect(page.getByText(/Older runs retain Entry/)).toBeVisible();
-  await page.getByRole("tab", { name: "Entry", exact: true }).click();
-  await expect(page.getByText(/Older runs retain Entry/)).toHaveCount(0);
+  const row = page.getByRole("listitem");
+  await expect(row).toHaveCount(1);
+  await expect(row).toContainText("0 measured · 10 unavailable · 5 cancelled");
+  await expect(row).toContainText("20%");
+  await expect(row).toContainText("2/10");
+  await expect(page.getByText(/3 older runs are preserved/)).toBeVisible();
+  await page.getByRole("tab", { name: "Capture gap", exact: true }).click();
+  await page.screenshot({
+    path: testInfo.outputPath("statistics-capture-unavailable.png"),
+    fullPage: true,
+  });
+});
+
+test("legacy-only data keeps trace path and export status visible", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await expect(page.getByText(summary.trace_path)).toBeVisible();
+  await page.getByRole("button", { name: "Copy event file path" }).click();
+  await expect(
+    page.getByRole("button", { name: "Copy event file path" }),
+  ).toHaveText("Copied");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    summary.trace_path,
+  );
+  await page.evaluate(() => {
+    const state = (
+      window as unknown as { statisticsFixture: { summary: StatsSummary } }
+    ).statisticsFixture;
+    state.summary.groups = [];
+    state.summary.pending_exports = 2;
+    state.summary.trace_error = "disk full";
+  });
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(page.getByText(/3 older runs are preserved/)).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText(
+    "Event file exports pending: 2",
+  );
+  await expect(page.getByRole("alert")).toHaveText(
+    "Event file export failed: disk full",
+  );
+  await expect(page.getByText(summary.trace_path)).toBeVisible();
+});
+
+test("same-model LLM variants remain distinct and selectable", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    const state = (
+      window as unknown as { statisticsFixture: { summary: StatsSummary } }
+    ).statisticsFixture;
+    const plain = state.summary.groups[1];
+    state.summary.groups = [
+      plain,
+      {
+        ...plain,
+        variant: 2,
+        is_current: false,
+        config: {
+          ...plain.config,
+          post_process: "true",
+          post_process_provider: "local",
+          post_process_model: "llm",
+          post_process_prompt_sha256: "abc123",
+        },
+      },
+    ];
+  });
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  const rows = page.getByRole("listitem");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(1)).toContainText("Config #2");
+  await rows
+    .nth(1)
+    .getByRole("button", { name: /model-fast/ })
+    .dblclick();
+  await expect(rows.first()).toHaveClass(/opacity-50/);
+  await expect(rows.nth(1).getByRole("table")).toBeVisible();
+  await expect(
+    rows.nth(1).getByRole("row", { name: "Post-processing On Off" }),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "Capture gap", exact: true }).click();
+  await expect(
+    rows.nth(1).getByRole("button", { name: /model-fast/ }),
+  ).toHaveAttribute("aria-pressed", "true");
+});
+
+test("copy failures remain visible and can be retried", async ({ page }) => {
+  await page.evaluate(() => {
+    Object.defineProperty(navigator.clipboard, "writeText", {
+      configurable: true,
+      value: async () => {
+        throw new Error("clipboard denied");
+      },
+    });
+  });
+  await page.getByRole("button", { name: "Copy event file path" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Couldn't copy path: Error: clipboard denied",
+  );
+  await page.evaluate(() => {
+    Object.defineProperty(navigator.clipboard, "writeText", {
+      configurable: true,
+      value: async () => {},
+    });
+  });
+  await page.getByRole("button", { name: "Copy event file path" }).click();
+  await expect(
+    page.getByRole("button", { name: "Copy event file path" }),
+  ).toHaveText("Copied");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("wheel zoom stays anchored and shared, clips real geometry, pans without selecting, and resets", async ({
@@ -400,11 +550,11 @@ test("wheel zoom stays anchored and shared, clips real geometry, pans without se
   await expect.poll(position).toBeCloseTo(firstPosition, 6);
 
   await page.getByRole("button", { name: "Zoom in", exact: true }).click();
-  await page.getByRole("tab", { name: "Post-processing", exact: true }).click();
+  await page.getByRole("tab", { name: "Capture gap", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Fit data", exact: true }),
   ).toHaveAttribute("aria-pressed", "true");
-  await page.getByRole("tab", { name: "Exit", exact: true }).click();
+  await page.getByRole("tab", { name: "Output gap", exact: true }).click();
   await expect.poll(position).toBeCloseTo(firstPosition, 6);
 
   const slow = rows.filter({ hasText: "model-slow" });
@@ -433,7 +583,7 @@ test("deep zoom keeps precise tick labels separate and stops at a finite limit",
   page,
 }) => {
   await page.setViewportSize({ width: 600, height: 900 });
-  await page.getByRole("tab", { name: "Entry", exact: true }).click();
+  await page.getByRole("tab", { name: "Capture gap", exact: true }).click();
   const zoomIn = page.getByRole("button", { name: "Zoom in", exact: true });
   for (let step = 0; step < 12 && !(await zoomIn.isDisabled()); step++)
     await zoomIn.click();

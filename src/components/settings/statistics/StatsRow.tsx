@@ -6,8 +6,11 @@ import { languageName } from "@/lib/constants/languages";
 import { BoxPlot } from "./BoxPlot";
 import { ConfigDiff, useConfigValueFormatter } from "./ConfigDiff";
 import {
+  METRICS,
   boxOf,
   failureRate,
+  eligibleRuns,
+  missingSamples,
   formatMetric,
   formatPercent,
   type Metric,
@@ -57,6 +60,14 @@ export const StatsRow: React.FC<StatsRowProps> = ({
       : []),
   ].join(" · ");
 
+  const missing = missingSamples(group, metric);
+  const samples = eligibleRuns(group) - missing;
+  const sampleSummary = t("settings.statistics.samples", {
+    samples,
+    missing,
+    cancellations: group.cancellations,
+  });
+
   const figures = box
     ? t("settings.statistics.boxSummary", {
         min: formatMetric(box.min),
@@ -67,6 +78,10 @@ export const StatsRow: React.FC<StatsRowProps> = ({
         mean: formatMetric(box.mean),
       })
     : t("settings.statistics.noTiming");
+  const metricLabel = t(
+    METRICS.find((item) => item.value === metric)?.label ??
+      "settings.statistics.metric.label",
+  );
   const clipped = box !== null && (box.min < axis.min || box.max > axis.max);
   const summary = clipped
     ? `${figures}. ${t("settings.statistics.scale.clipped")}`
@@ -74,7 +89,7 @@ export const StatsRow: React.FC<StatsRowProps> = ({
   const failed = failureRate(group);
   const failureTitle = t("settings.statistics.failureTitle", {
     failures: group.failures,
-    runs: group.runs,
+    runs: eligibleRuns(group),
   });
 
   return (
@@ -117,7 +132,7 @@ export const StatsRow: React.FC<StatsRowProps> = ({
             axis={axis}
             width={chartWidth}
             highlighted={selected}
-            summary={summary}
+            summary={`${metricLabel}. ${summary}. ${sampleSummary}`}
           />
         </div>
         <div className="text-end text-sm tabular-nums" title={summary}>
@@ -129,7 +144,7 @@ export const StatsRow: React.FC<StatsRowProps> = ({
         >
           {formatPercent(failed)}
           <span className="block text-xs text-ink-3">
-            {group.failures}/{group.runs}
+            {group.failures}/{eligibleRuns(group)}
           </span>
         </div>
         <button
@@ -154,6 +169,7 @@ export const StatsRow: React.FC<StatsRowProps> = ({
           />
         </button>
       </div>
+      <p className="px-2 pb-2 text-xs text-ink-3">{sampleSummary}</p>
       {expanded && <ConfigDiff group={group} current={current} />}
     </div>
   );

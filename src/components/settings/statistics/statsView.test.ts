@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import type { BoxStats, StatsGroup } from "@/bindings";
 import {
   configDifferences,
+  failureRate,
+  eligibleRuns,
+  missingSamples,
   formatMetric,
   formatAxisTick,
   formatPercent,
@@ -38,11 +41,26 @@ const group = (
   failures,
   first_run: 0,
   last_run: 0,
-  entry_ms: null,
-  exit_ms: medianMs === null ? null : box(medianMs),
-  post_process_ms: null,
-  legacy_timing_runs: 0,
+  capture_gap_ms: null,
+  output_gap_ms: medianMs === null ? null : box(medianMs),
+  capture_missing: runs,
+  output_missing: medianMs === null ? runs : 0,
+  cancellations: 0,
+  capture_unavailable_reasons: {},
+  output_unavailable_reasons: {},
 });
+
+const cancelled = {
+  ...group("cancelled", null, 10, 2),
+  cancellations: 5,
+  capture_missing: 5,
+  output_missing: 5,
+};
+assert.equal(eligibleRuns(cancelled), 5);
+assert.equal(failureRate(cancelled), 0.4);
+assert.equal(failureRate({ ...cancelled, runs: 5, failures: 0 }), 0);
+assert.equal(missingSamples(cancelled, "capture_gap_ms"), 5);
+assert.equal(missingSamples(cancelled, "output_gap_ms"), 5);
 
 const names = (groups: StatsGroup[]) => groups.map((g) => g.model);
 
@@ -51,12 +69,12 @@ const groups = [
   group("none", null, 4, 4),
   group("fast", 100, 10, 3),
 ];
-assert.deepEqual(names(sortGroups(groups, "exit_ms", "speed")), [
+assert.deepEqual(names(sortGroups(groups, "output_gap_ms", "speed")), [
   "fast",
   "slow",
   "none",
 ]);
-assert.deepEqual(names(sortGroups(groups, "exit_ms", "failures")), [
+assert.deepEqual(names(sortGroups(groups, "output_gap_ms", "failures")), [
   "slow",
   "fast",
   "none",
@@ -65,7 +83,7 @@ assert.deepEqual(
   names(
     sortGroups(
       [group("a", null, 4, 4), group("b", null, 2, 2)],
-      "exit_ms",
+      "output_gap_ms",
       "speed",
     ),
   ),

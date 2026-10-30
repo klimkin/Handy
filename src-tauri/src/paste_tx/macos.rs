@@ -24,9 +24,14 @@ use objc2_foundation::{NSArray, NSInteger, NSObject, NSString};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use super::{evaluate, send_chord, TxState, WaitDecision};
+use super::{
+    evaluate, send_chord, settlement_result, Completion, PasteOptions, TxState, WaitDecision,
+};
 use crate::clipboard::send_return_key;
 use crate::input::EnigoState;
+use crate::managers::stats::trace::{
+    Event, OutputFailure, OutputKind, OutputReceipt, OutputResult,
+};
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
 
 /// Concealment marker types declared alongside the text so that well-behaved
@@ -74,7 +79,11 @@ define_class!(
                 // Concealment marker types are never handed out.
                 NSString::from_str("")
             };
-            let _ = pasteboard.setString_forType(&payload, data_type);
+            if !pasteboard.setString_forType(&payload, data_type) && is_text {
+                if let Ok(mut state) = ivars.state.lock() {
+                    state.delivery_failed = true;
+                }
+            }
         }
 
         #[unsafe(method(pasteboardChangedOwner:))]
@@ -107,7 +116,7 @@ struct MacPending {
     preserve_transcript: bool,
     /// The transcript, for the `preserve_transcript` re-write at settle time.
     transcript: String,
-    settled: bool,
+    completion: Completion,
 }
 
 /// The transaction currently holding the clipboard, if any. A new paste
@@ -122,62 +131,84 @@ fn settle(
     pending: &Arc<Mutex<MacPending>>,
     app_handle: &AppHandle,
     enigo: Option<&mut enigo::Enigo>,
+    superseded: bool,
 ) {
-    let mut p = match pending.lock() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    if p.settled {
+    let mut p = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !p.completion.is_pending() {
         return;
     }
-    p.settled = true;
-
-    let (receipt_seen, ownership_lost) = match p.state.lock() {
-        Ok(st) => (st.any_receipt_after_injection(), st.ownership_lost),
-        Err(_) => (false, true),
+    let (receipt_seen, still_ours) = {
+        let state = p
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ours = !state.ownership_lost
+            && NSPasteboard::generalPasteboard().changeCount() == p.change_count;
+        (
+            state.any_receipt_after_injection()
+                && !state.injection_failed
+                && !state.delivery_failed,
+            ours,
+        )
     };
-
-    // Auto-submit only once the target demonstrably read the transcript;
-    // pressing Enter after an unconfirmed paste could submit stale content.
-    if p.auto_submit && receipt_seen {
-        match enigo {
-            Some(e) => {
-                let _ = send_return_key(e, p.auto_submit_key);
+    let mut completion = std::mem::take(&mut p.completion);
+    completion.settle_with(|| {
+        let submit = if p.auto_submit && receipt_seen && still_ours {
+            match enigo {
+                Some(enigo) => send_return_key(enigo, p.auto_submit_key),
+                None => app_handle
+                    .try_state::<EnigoState>()
+                    .ok_or_else(|| "Input unavailable".to_string())
+                    .and_then(|state| {
+                        state
+                            .0
+                            .lock()
+                            .map_err(|_| "Input poisoned".to_string())
+                            .and_then(|mut enigo| send_return_key(&mut enigo, p.auto_submit_key))
+                    }),
             }
-            None => {
-                if let Some(enigo_state) = app_handle.try_state::<EnigoState>() {
-                    if let Ok(mut e) = enigo_state.0.lock() {
-                        let _ = send_return_key(&mut e, p.auto_submit_key);
-                    }
-                }
-            }
-        }
-    }
-
-    let still_ours =
-        !ownership_lost && NSPasteboard::generalPasteboard().changeCount() == p.change_count;
-    if !still_ours {
-        info!("[reliable-paste] clipboard changed externally; leaving it untouched");
-    } else if p.preserve_transcript {
-        // The user asked for the transcript to stay on the clipboard: replace
-        // the concealed promise with plain text so clipboard managers record
-        // it and it survives this app exiting.
-        let _ = app_handle.clipboard().write_text(&p.transcript);
-        info!("[reliable-paste] left transcript on clipboard as plain text");
-    } else {
-        let clipboard = app_handle.clipboard();
-        if let Some(text) = &p.saved_text {
-            let _ = clipboard.write_text(text);
-        } else if let Some(image) = &p.saved_image {
-            let _ = clipboard.write_image(image);
+            .map_err(|_| OutputFailure::AutoSubmit)
         } else {
-            let _ = clipboard.clear();
+            Ok(())
+        };
+        let (result, still_ours) = {
+            let state = p
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ours = !state.ownership_lost
+                && NSPasteboard::generalPasteboard().changeCount() == p.change_count;
+            (settlement_result(&state, ours, superseded), ours)
+        };
+        let restore = if !still_ours {
+            Ok(())
+        } else if p.preserve_transcript {
+            app_handle
+                .clipboard()
+                .write_text(&p.transcript)
+                .map_err(|_| OutputFailure::Restore)
+        } else {
+            let clipboard = app_handle.clipboard();
+            if let Some(text) = &p.saved_text {
+                clipboard
+                    .write_text(text)
+                    .map_err(|_| OutputFailure::Restore)
+            } else if let Some(image) = &p.saved_image {
+                clipboard
+                    .write_image(image)
+                    .map_err(|_| OutputFailure::Restore)
+            } else {
+                clipboard.clear().map_err(|_| OutputFailure::Restore)
+            }
+        };
+        match submit.and(restore) {
+            Ok(()) => result,
+            Err(failure) => OutputResult::Failed(failure),
         }
-        info!("[reliable-paste] restored previous clipboard");
-    }
-
-    // Release the owner; any outstanding promise dies with the pasteboard
-    // contents we just replaced (or with the external change).
+    });
+    p.completion = completion;
     p.provider = None;
 }
 
@@ -189,7 +220,21 @@ fn flush_pending(app_handle: &AppHandle, enigo: &mut enigo::Enigo) {
         Err(_) => None,
     };
     if let Some(previous) = previous {
-        settle(&previous, app_handle, Some(enigo));
+        settle(&previous, app_handle, Some(enigo), true);
+    }
+}
+
+struct SettlementDispatch(Arc<Mutex<MacPending>>);
+
+impl Drop for SettlementDispatch {
+    fn drop(&mut self) {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending
+            .completion
+            .settle(OutputResult::Failed(OutputFailure::Disconnected), || Ok(()));
     }
 }
 
@@ -198,27 +243,22 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle) {
         let outcome = loop {
             thread::sleep(Duration::from_millis(15));
             let (decision, state_snapshot) = {
-                let p = match pending.lock() {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                if p.settled {
-                    // A newer paste settled this transaction already.
+                let p = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !p.completion.is_pending() {
                     return;
                 }
-                let result = match p.state.lock() {
-                    Ok(st) => {
-                        let now = Instant::now();
-                        let snapshot = (
-                            st.any_receipt_after_injection(),
-                            st.ownership_lost,
-                            st.injection_failed,
-                        );
-                        (evaluate(&st, now), snapshot)
-                    }
-                    Err(_) => return,
-                };
-                result
+                let state = p
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let snapshot = (
+                    state.any_receipt_after_injection(),
+                    state.ownership_lost,
+                    state.injection_failed,
+                );
+                (evaluate(&state, Instant::now()), snapshot)
             };
             if let WaitDecision::Finish = decision {
                 break state_snapshot;
@@ -236,19 +276,19 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle) {
             info!("[reliable-paste] settling: no read within timeout, restoring anyway");
         }
 
-        let pending_for_finish = pending.clone();
+        let dispatch = SettlementDispatch(pending.clone());
         let app_for_finish = app_handle.clone();
         let _ = app_handle.run_on_main_thread(move || {
-            settle(&pending_for_finish, &app_for_finish, None);
+            settle(&dispatch.0, &app_for_finish, None, false);
             if let Ok(mut slot) = PENDING.lock() {
-                let is_us = slot
+                if slot
                     .as_ref()
-                    .map(|current| Arc::ptr_eq(current, &pending))
-                    .unwrap_or(false);
-                if is_us {
+                    .is_some_and(|current| Arc::ptr_eq(current, &pending))
+                {
                     *slot = None;
                 }
             }
+            drop(dispatch);
         });
     });
 }
@@ -258,10 +298,15 @@ pub(super) fn run(
     app_handle: &AppHandle,
     paste_method: &PasteMethod,
     enigo: &mut enigo::Enigo,
-    auto_submit: bool,
-    auto_submit_key: AutoSubmitKey,
-    clipboard_handling: ClipboardHandling,
-) -> Result<(), String> {
+    options: PasteOptions,
+) -> Result<OutputReceipt, String> {
+    let PasteOptions {
+        auto_submit,
+        auto_submit_key,
+        clipboard_handling,
+        delay_after,
+        trace,
+    } = options;
     // Settle any previous transaction first so the snapshot below captures the
     // user's original clipboard, not the previous transcript.
     flush_pending(app_handle, enigo);
@@ -303,6 +348,9 @@ pub(super) fn run(
     }
     match send_chord(enigo, paste_method) {
         Ok(()) => {
+            if let Some(trace) = trace {
+                trace.event(Instant::now(), Event::PasteInjected);
+            }
             info!("[reliable-paste] paste chord sent ({paste_method:?})");
         }
         Err(e) => {
@@ -315,6 +363,14 @@ pub(super) fn run(
         }
     }
 
+    {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.settle_after = Some(Instant::now() + delay_after);
+        state.injection_finished = true;
+    }
+    let (completion, receiver) = Completion::channel();
     let pending = Arc::new(Mutex::new(MacPending {
         state,
         saved_text,
@@ -325,12 +381,12 @@ pub(super) fn run(
         auto_submit_key,
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
         transcript: text.to_string(),
-        settled: false,
+        completion,
     }));
     if let Ok(mut slot) = PENDING.lock() {
         *slot = Some(pending.clone());
     }
     spawn_waiter(pending, app_handle.clone());
 
-    Ok(())
+    Ok(OutputReceipt::pending(receiver, OutputKind::ClipboardPaste))
 }

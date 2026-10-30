@@ -866,15 +866,13 @@
     },
     "statistics": {
       "title": "Statistics",
-      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "description": "本機聽寫的缺失、延遲與結果。",
       "metric": {
         "label": "Metric",
-        "entry": "Entry",
-        "exit": "Exit",
-        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
-        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
-        "postProcess": "Post-processing",
-        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+        "captureGap": "擷取缺口",
+        "outputGap": "輸出延遲",
+        "captureGapHint": "啟用後、VAD之前遺失的音訊。缺少樣本時間戳記或連續涵蓋證據時，數值為未知，而非零。音訊區塊到達時間不是擷取時間。",
+        "outputGapHint": "從原始停止輸入到輸出完成，包括LLM後處理、輸出延遲及剪貼簿還原。完成不代表目標應用程式已顯示文字。"
       },
       "sort": {
         "label": "Sort",
@@ -894,7 +892,7 @@
       },
       "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
       "failureTitle": "{{failures}} of {{runs}} runs failed",
-      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "legend": "鬚線表示最小值和最大值，箱體表示中間50%的資料（Q1–Q3），線表示中位數，菱形表示平均值。",
       "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
       "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
       "loadError": "Couldn't load statistics: {{error}}",
@@ -942,10 +940,18 @@
         "paste_delay_after_ms": "Post-paste delay (ms)",
         "extra_recording_buffer_ms": "Post-stop buffer (ms)",
         "post_process_provider": "Post-processing provider",
-        "post_process_model": "Post-processing model"
+        "post_process_model": "Post-processing model",
+        "post_process_prompt_sha256": "提示詞指紋",
+        "post_process_prompt": "提示詞ID",
+        "auto_submit": "自動送出",
+        "auto_submit_key": "自動送出按鍵",
+        "clipboard_handling": "剪貼簿處理",
+        "append_trailing_space": "附加尾部空格",
+        "typing_tool": "輸入工具",
+        "reliable_paste": "可靠貼上"
       },
       "noTiming": "No timing samples yet",
-      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "samplingHint": "測量排除取消的執行。後續處理失敗時，擷取測量仍可有效；輸出需要確認完成。取消不計為失敗。設定在啟用時記錄；未偵測到語言的執行單獨分組。",
       "scale": {
         "label": "Shared scale",
         "fit": "Fit data",
@@ -955,7 +961,16 @@
         "zoomOut": "Zoom out",
         "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
       },
-      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
+      "legacyTimingHint": "已保留{{runs}}次舊執行，不納入這些指標。新的聽寫將提供新的測量。",
+      "samples": "已測量{{samples}}次 · 無法取得{{missing}}次 · 已取消{{cancellations}}次",
+      "trace": {
+        "title": "事件檔案",
+        "copyPath": "複製事件檔案路徑",
+        "copied": "已複製",
+        "pending": "待匯出的事件：{{runs}}次",
+        "error": "事件匯出失敗：{{error}}",
+        "copyError": "無法複製路徑：{{error}}"
+      }
     },
     "about": {
       "title": "關於",

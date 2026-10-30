@@ -866,15 +866,13 @@
     },
     "statistics": {
       "title": "Statistics",
-      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "description": "स्थानीय श्रुतलेख के अंतराल और परिणाम।",
       "metric": {
         "label": "Metric",
-        "entry": "Entry",
-        "exit": "Exit",
-        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
-        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
-        "postProcess": "Post-processing",
-        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+        "captureGap": "कैप्चर अंतराल",
+        "outputGap": "आउटपुट विलंब",
+        "captureGapHint": "सक्रियण के बाद, VAD से पहले छूटा ऑडियो। सैंपल टाइमस्टैम्प या निरंतर कवरेज न होने पर मान अज्ञात है, शून्य नहीं। ब्लॉक पहुँचने का समय कैप्चर का समय नहीं है।",
+        "outputGapHint": "मूल रोक संकेत से आउटपुट पूरा होने तक, LLM, आउटपुट विलंब और क्लिपबोर्ड बहाली सहित। इससे लक्षित ऐप में पाठ दिखने की पुष्टि नहीं होती।"
       },
       "sort": {
         "label": "Sort",
@@ -894,7 +892,7 @@
       },
       "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
       "failureTitle": "{{failures}} of {{runs}} runs failed",
-      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "legend": "सिरे न्यूनतम और अधिकतम, बॉक्स बीच के 50% (Q1–Q3), रेखा माध्यिका और हीरा औसत दिखाते हैं।",
       "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
       "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
       "loadError": "Couldn't load statistics: {{error}}",
@@ -942,10 +940,18 @@
         "paste_delay_after_ms": "Post-paste delay (ms)",
         "extra_recording_buffer_ms": "Post-stop buffer (ms)",
         "post_process_provider": "Post-processing provider",
-        "post_process_model": "Post-processing model"
+        "post_process_model": "Post-processing model",
+        "post_process_prompt_sha256": "प्रॉम्प्ट फ़िंगरप्रिंट",
+        "post_process_prompt": "प्रॉम्प्ट आईडी",
+        "auto_submit": "ऑटो सबमिट",
+        "auto_submit_key": "ऑटो सबमिट कुंजी",
+        "clipboard_handling": "क्लिपबोर्ड मैनेजमेंट",
+        "append_trailing_space": "आखिर में स्पेस जोड़ें",
+        "typing_tool": "टाइपिंग टूल",
+        "reliable_paste": "भरोसेमंद पेस्ट"
       },
       "noTiming": "No timing samples yet",
-      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "samplingHint": "माप में रद्द किए गए रन शामिल नहीं हैं। प्रोसेसिंग विफल होने पर भी कैप्चर मान्य हो सकता है; आउटपुट के लिए पुष्टि किया गया समापन आवश्यक है। रद्द करना विफलता नहीं है। सेटिंग सक्रियण पर दर्ज होती है; अनपहचानी भाषा अलग रहती है।",
       "scale": {
         "label": "Shared scale",
         "fit": "Fit data",
@@ -955,7 +961,16 @@
         "zoomOut": "Zoom out",
         "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
       },
-      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
+      "legacyTimingHint": "{{runs}} पुराने रन सुरक्षित हैं और इन मापों में शामिल नहीं हैं। नए श्रुतलेख नए माप देंगे।",
+      "samples": "{{samples}} मापे गए · {{missing}} अनुपलब्ध · {{cancellations}} रद्द",
+      "trace": {
+        "title": "इवेंट फ़ाइल",
+        "copyPath": "इवेंट फ़ाइल का पथ कॉपी करें",
+        "copied": "कॉपी किया गया",
+        "pending": "लंबित इवेंट निर्यात: {{runs}}",
+        "error": "इवेंट निर्यात विफल: {{error}}",
+        "copyError": "पथ कॉपी नहीं हुआ: {{error}}"
+      }
     },
     "about": {
       "title": "के बारे में",

@@ -100,6 +100,9 @@ fn native_windows_machine() -> Option<u16> {
 /// Centralized cancellation function that can be called from anywhere in the app.
 /// Handles cancelling both recording and transcription operations and updates UI state.
 pub fn cancel_current_operation(app: &AppHandle) {
+    cancel_current_operation_at(app, std::time::Instant::now());
+}
+pub fn cancel_current_operation_at(app: &AppHandle, at: std::time::Instant) {
     info!("Initiating operation cancellation...");
 
     // Unregister the cancel shortcut asynchronously
@@ -108,7 +111,7 @@ pub fn cancel_current_operation(app: &AppHandle) {
     // Cancel any ongoing recording
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();
     let recording_was_active = audio_manager.is_recording();
-    audio_manager.cancel_recording();
+    let capture = audio_manager.cancel_recording();
 
     // Abandon any live streaming transcription, and stop a transcription
     // already in progress
@@ -127,7 +130,7 @@ pub fn cancel_current_operation(app: &AppHandle) {
 
     // Notify coordinator so it can keep lifecycle state coherent.
     if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active);
+        coordinator.notify_cancel(recording_was_active, capture, at);
     }
 
     info!("Operation cancellation completed - returned to idle state");

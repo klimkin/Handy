@@ -1,6 +1,10 @@
 use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
-use crate::settings::ShortcutActivation;
+use crate::managers::stats::trace::{
+    CaptureEvidence, Event, InputOrigin, InputStamp, RunOwner, TerminalOutcome, TraceReporter,
+};
+use crate::managers::stats::{requested_config, StatsManager};
+use crate::settings::{get_settings, ShortcutActivation};
 use log::{debug, error, warn};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -9,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
-use tauri_specta::Event;
+use tauri_specta::Event as _;
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
@@ -200,8 +204,12 @@ enum Effect {
 
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
-    Input(InputEvent, Instant),
-    Cancel { recording_was_active: bool },
+    Input(InputEvent, InputStamp),
+    Cancel {
+        recording_was_active: bool,
+        capture: Option<CaptureEvidence>,
+        at: Instant,
+    },
     ProcessingFinished,
 }
 
@@ -579,6 +587,7 @@ impl CoordinatorState {
 /// returned [`Effect`]s.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
+    stats: Arc<StatsManager>,
 }
 
 pub fn is_transcribe_binding(id: &str) -> bool {
@@ -587,11 +596,13 @@ pub fn is_transcribe_binding(id: &str) -> bool {
 
 impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
+        let stats = Arc::clone(&app.state::<Arc<StatsManager>>());
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = CoordinatorState::new();
+                let mut traces = RuntimeTraces::default();
 
                 loop {
                     let cmd = if let Some(deadline) = state.grace_deadline() {
@@ -600,8 +611,9 @@ impl TranscriptionCoordinator {
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 let was_locked = state.is_recording_locked();
                                 if let Some(effect) = state.on_grace_expired() {
-                                    run_effect(&app, &mut state, effect);
+                                    run_effect(&app, &mut state, &mut traces, effect, None);
                                 }
+                                traces.reconcile_pending(&app, &state, None, Instant::now());
                                 if !was_locked && state.is_recording_locked() {
                                     emit_recording_phase(&app, RecordingPhase::Locked);
                                 }
@@ -618,25 +630,44 @@ impl TranscriptionCoordinator {
 
                     let was_locked = state.is_recording_locked();
                     match cmd {
-                        Command::Input(input, triggered_at) => {
-                            if let Some(effect) = state.on_input(input, triggered_at) {
-                                run_effect(&app, &mut state, effect);
+                        Command::Input(input, stamp) => {
+                            if app.state::<Arc<StatsManager>>().is_shutting_down() {
+                                continue;
+                            }
+                            let effect = state.on_input(input, stamp.at);
+                            traces.reconcile_pending(&app, &state, Some(&stamp), stamp.at);
+                            if let Some(effect) = effect {
+                                run_effect(&app, &mut state, &mut traces, effect, Some(stamp));
                             }
                         }
                         Command::Cancel {
                             recording_was_active,
+                            capture,
+                            at,
                         } => {
                             // A cancel while transcribing ends the take too.
                             let busy =
                                 recording_was_active || matches!(state.stage, Stage::Processing);
                             state.on_cancel(recording_was_active);
+                            if let Some(trace) = &traces.processing {
+                                trace.event(at, Event::CancelRequested);
+                            }
+                            if let Some(mut run) = traces.active.take() {
+                                if let Some(capture) = capture {
+                                    run.captured(capture);
+                                }
+                                run.reporter().event(at, Event::CancelRequested);
+                                run.finish(TerminalOutcome::Cancelled, at, None);
+                            }
+                            traces.reconcile_pending(&app, &state, None, at);
                             if busy {
                                 emit_recording_phase(&app, RecordingPhase::Cancelled);
                             }
                         }
                         Command::ProcessingFinished => {
+                            traces.processing = None;
                             if let Some(effect) = state.on_processing_finished() {
-                                run_effect(&app, &mut state, effect);
+                                run_effect(&app, &mut state, &mut traces, effect, None);
                             }
                         }
                     }
@@ -651,7 +682,7 @@ impl TranscriptionCoordinator {
             }
         });
 
-        Self { tx }
+        Self { tx, stats }
     }
 
     /// Send a keyboard input event for a transcribe binding. `hold_threshold`
@@ -663,7 +694,7 @@ impl TranscriptionCoordinator {
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
-        triggered_at: Instant,
+        stamp: InputStamp,
     ) {
         self.send(
             InputEvent {
@@ -674,13 +705,14 @@ impl TranscriptionCoordinator {
                 hold_threshold,
                 external: false,
             },
-            triggered_at,
+            stamp,
         );
     }
 
     /// Send an external trigger (SIGUSR2, CLI flag). Always a toggle press,
     /// always exempt from debounce — see [`InputEvent::external`].
     pub fn send_external_input(&self, binding_id: &str, source: &str) {
+        let stamp = self.stats.input_stamp(InputOrigin::ExternalCommand);
         self.send(
             InputEvent {
                 binding_id: binding_id.to_string(),
@@ -690,21 +722,29 @@ impl TranscriptionCoordinator {
                 hold_threshold: Duration::ZERO,
                 external: true,
             },
-            Instant::now(),
+            stamp,
         );
     }
 
-    fn send(&self, input: InputEvent, triggered_at: Instant) {
-        if self.tx.send(Command::Input(input, triggered_at)).is_err() {
+    fn send(&self, input: InputEvent, mut stamp: InputStamp) {
+        stamp.mode = Some(input.mode);
+        if self.tx.send(Command::Input(input, stamp)).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
 
-    pub fn notify_cancel(&self, recording_was_active: bool) {
+    pub fn notify_cancel(
+        &self,
+        recording_was_active: bool,
+        capture: Option<CaptureEvidence>,
+        at: Instant,
+    ) {
         if self
             .tx
             .send(Command::Cancel {
                 recording_was_active,
+                capture,
+                at,
             })
             .is_err()
         {
@@ -719,17 +759,129 @@ impl TranscriptionCoordinator {
     }
 }
 
-fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
+#[derive(Default)]
+struct RuntimeTraces {
+    active: Option<RunOwner>,
+    processing: Option<TraceReporter>,
+    pending: Option<(Instant, RunOwner)>,
+}
+impl RuntimeTraces {
+    fn begin(app: &AppHandle, binding: &str, stamp: InputStamp) -> RunOwner {
+        let settings = get_settings(app);
+        let mut config = requested_config(
+            &settings,
+            &settings.selected_model,
+            binding == "transcribe_with_post_process",
+        );
+        if let Some(mode) = stamp.mode {
+            config.insert(
+                "shortcut_activation".into(),
+                serde_json::to_value(mode)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            );
+        }
+        app.state::<Arc<StatsManager>>().begin(stamp, config)
+    }
+    fn reconcile_pending(
+        &mut self,
+        app: &AppHandle,
+        state: &CoordinatorState,
+        stamp: Option<&InputStamp>,
+        at: Instant,
+    ) {
+        let pending = state.pending_press.as_ref();
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(time, _)| pending.is_none_or(|p| p.pressed_at != *time))
+        {
+            // A drain moves the pending owner in run_effect before reconciliation.
+            if let Some((_, run)) = self.pending.take() {
+                run.finish(TerminalOutcome::Cancelled, at, None);
+            }
+        }
+        if self.pending.is_none() {
+            if let (Some(pending), Some(stamp)) = (pending, stamp) {
+                self.pending = Some((
+                    pending.pressed_at,
+                    Self::begin(app, &pending.binding_id, stamp.clone()),
+                ));
+            }
+        }
+    }
+}
+fn run_effect(
+    app: &AppHandle,
+    state: &mut CoordinatorState,
+    traces: &mut RuntimeTraces,
+    effect: Effect,
+    stamp: Option<InputStamp>,
+) {
     match effect {
         Effect::Start {
             binding_id,
             hotkey_string,
             triggered_at,
         } => {
-            let started = start(app, &binding_id, &hotkey_string, triggered_at);
+            let run = if traces
+                .pending
+                .as_ref()
+                .is_some_and(|(at, _)| *at == triggered_at)
+            {
+                traces.pending.take().map(|(_, run)| run)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                RuntimeTraces::begin(
+                    app,
+                    &binding_id,
+                    stamp.unwrap_or_else(|| {
+                        InputStamp::at(triggered_at, InputOrigin::ShortcutCallback)
+                    }),
+                )
+            });
+            if app.state::<Arc<StatsManager>>().is_shutting_down() {
+                state.on_start_result(&binding_id, false);
+                run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                return;
+            }
+            let mut failure = None;
+            let audio = app.try_state::<Arc<AudioRecordingManager>>();
+            let cancel_before = audio.as_ref().map(|a| a.cancel_generation());
+            let started = if let Some(action) = ACTION_MAP.get(&binding_id) {
+                failure = action.start_traced(
+                    app,
+                    &binding_id,
+                    &hotkey_string,
+                    triggered_at,
+                    run.reporter(),
+                );
+                app.try_state::<Arc<AudioRecordingManager>>()
+                    .is_some_and(|a| a.is_recording())
+            } else {
+                false
+            };
             state.on_start_result(&binding_id, started);
             if started {
+                traces.active = Some(run);
                 emit_recording_phase(app, RecordingPhase::Started);
+            } else {
+                let cancelled = audio
+                    .as_ref()
+                    .zip(cancel_before)
+                    .is_some_and(|(audio, before)| audio.was_cancelled_since(before));
+                run.finish(
+                    if cancelled {
+                        TerminalOutcome::Cancelled
+                    } else {
+                        failure.unwrap_or(TerminalOutcome::CaptureFailed)
+                    },
+                    Instant::now(),
+                    None,
+                );
             }
         }
         Effect::Stop {
@@ -737,35 +889,16 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
             hotkey_string,
             triggered_at,
         } => {
-            stop(app, &binding_id, &hotkey_string, triggered_at);
+            if let (Some(action), Some(mut run)) =
+                (ACTION_MAP.get(&binding_id), traces.active.take())
+            {
+                run.set_stop(triggered_at);
+                traces.processing = Some(run.reporter());
+                action.stop_traced(app, &binding_id, &hotkey_string, triggered_at, run);
+            }
             emit_recording_phase(app, RecordingPhase::Stopped);
         }
     }
-}
-
-/// Execute a start effect; returns whether recording actually began, so the
-/// state machine can roll back its optimistic transition on failure.
-fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str, triggered_at: Instant) -> bool {
-    let Some(action) = ACTION_MAP.get(binding_id) else {
-        warn!("No action in ACTION_MAP for '{binding_id}'");
-        return false;
-    };
-    action.start(app, binding_id, hotkey_string, triggered_at);
-    let recording = app
-        .try_state::<Arc<AudioRecordingManager>>()
-        .is_some_and(|a| a.is_recording());
-    if !recording {
-        debug!("Start for '{binding_id}' did not begin recording; staying idle");
-    }
-    recording
-}
-
-fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str, triggered_at: Instant) {
-    let Some(action) = ACTION_MAP.get(binding_id) else {
-        warn!("No action in ACTION_MAP for '{binding_id}'");
-        return;
-    };
-    action.stop(app, binding_id, hotkey_string, triggered_at);
 }
 
 #[cfg(test)]

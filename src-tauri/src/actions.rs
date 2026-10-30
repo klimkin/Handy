@@ -5,7 +5,11 @@ use crate::audio_toolkit::VadPolicy;
 use crate::managers::audio::{recording_error_type, AudioRecordingManager};
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
-use crate::managers::stats::{config_snapshot, run_language, RunRecord, RunResult, StatsManager};
+use crate::managers::stats::trace::{
+    CompletionBasis, Event, OutputFailure, OutputKind, OutputResult, OutputSettlement, PhaseKind,
+    PhaseOutcome, RunOwner, TerminalOutcome, TraceReporter,
+};
+use crate::managers::stats::{requested_config, run_language};
 use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTraits};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::{Transcription, TranscriptionManager};
@@ -27,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::Manager;
 use tauri::{AppHandle, Emitter};
-use tauri_specta::Event;
+use tauri_specta::Event as _;
 
 /// How a dictation ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -56,15 +60,28 @@ fn finish_dictation(
     outcome: TranscriptionOutcome,
     sample_count: usize,
     stop_time: Instant,
-    stats: Option<RunRecord>,
+    stats: Option<RunOwner>,
 ) {
-    let wait_seconds = stop_time.elapsed().as_secs_f64();
-    if let Some(mut stats) = stats {
-        stats.release_to_paste_ms = wait_seconds * 1000.0;
-        if outcome == TranscriptionOutcome::Failed {
-            stats.result = RunResult::Error;
-        }
-        app.state::<Arc<StatsManager>>().record_run(&stats);
+    finish_dictation_at(app, outcome, sample_count, stop_time, stats, Instant::now());
+}
+fn finish_dictation_at(
+    app: &AppHandle,
+    outcome: TranscriptionOutcome,
+    sample_count: usize,
+    stop_time: Instant,
+    stats: Option<RunOwner>,
+    completed_at: Instant,
+) {
+    let wait_seconds = completed_at
+        .saturating_duration_since(stop_time)
+        .as_secs_f64();
+    if let Some(stats) = stats {
+        let terminal = match outcome {
+            TranscriptionOutcome::Typed => TerminalOutcome::OutputCompleted,
+            TranscriptionOutcome::Empty | TranscriptionOutcome::Silent => TerminalOutcome::Empty,
+            TranscriptionOutcome::Failed => TerminalOutcome::ProcessingFailed,
+        };
+        stats.finish(terminal, completed_at, None);
     }
     let event = TranscriptionCompleteEvent {
         outcome,
@@ -116,6 +133,27 @@ impl Drop for FinishGuard {
 
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
+    fn start_traced(
+        &self,
+        app: &AppHandle,
+        binding_id: &str,
+        shortcut_str: &str,
+        triggered_at: Instant,
+        _trace: TraceReporter,
+    ) -> Option<TerminalOutcome> {
+        self.start(app, binding_id, shortcut_str, triggered_at);
+        None
+    }
+    fn stop_traced(
+        &self,
+        app: &AppHandle,
+        binding_id: &str,
+        shortcut_str: &str,
+        triggered_at: Instant,
+        _run: RunOwner,
+    ) {
+        self.stop(app, binding_id, shortcut_str, triggered_at);
+    }
     fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, triggered_at: Instant);
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, triggered_at: Instant);
 }
@@ -187,15 +225,32 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
 
 struct PostProcessAttempt {
     text: Option<String>,
+    #[cfg(test)]
     elapsed: Duration,
 }
 
+#[cfg(test)]
 async fn post_process_transcription(
     settings: &AppSettings,
     transcription: &str,
 ) -> Option<PostProcessAttempt> {
+    post_process_transcription_traced(settings, transcription, None).await
+}
+async fn post_process_transcription_traced(
+    settings: &AppSettings,
+    transcription: &str,
+    trace: Option<TraceReporter>,
+) -> Option<PostProcessAttempt> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
+        if let Some(t) = &trace {
+            t.event(
+                Instant::now(),
+                Event::PostProcessSkipped {
+                    reason: crate::managers::stats::trace::SkipReason::EmptyInput,
+                },
+            );
+        }
         return None;
     }
 
@@ -203,6 +258,14 @@ async fn post_process_transcription(
         Some(provider) => provider,
         None => {
             debug!("Post-processing enabled but no provider is selected");
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::PostProcessSkipped {
+                        reason: crate::managers::stats::trace::SkipReason::ProviderUnavailable,
+                    },
+                );
+            }
             return None;
         }
     };
@@ -218,6 +281,14 @@ async fn post_process_transcription(
             "Post-processing skipped because provider '{}' has no model configured",
             provider.id
         );
+        if let Some(t) = &trace {
+            t.event(
+                Instant::now(),
+                Event::PostProcessSkipped {
+                    reason: crate::managers::stats::trace::SkipReason::ModelUnavailable,
+                },
+            );
+        }
         return None;
     }
 
@@ -225,6 +296,14 @@ async fn post_process_transcription(
         Some(id) => id.clone(),
         None => {
             debug!("Post-processing skipped because no prompt is selected");
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::PostProcessSkipped {
+                        reason: crate::managers::stats::trace::SkipReason::PromptUnavailable,
+                    },
+                );
+            }
             return None;
         }
     };
@@ -240,12 +319,28 @@ async fn post_process_transcription(
                 "Post-processing skipped because prompt '{}' was not found",
                 selected_prompt_id
             );
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::PostProcessSkipped {
+                        reason: crate::managers::stats::trace::SkipReason::PromptUnavailable,
+                    },
+                );
+            }
             return None;
         }
     };
 
     if prompt.trim().is_empty() {
         debug!("Post-processing skipped because the selected prompt is empty");
+        if let Some(t) = &trace {
+            t.event(
+                Instant::now(),
+                Event::PostProcessSkipped {
+                    reason: crate::managers::stats::trace::SkipReason::PromptUnavailable,
+                },
+            );
+        }
         return None;
     }
 
@@ -269,16 +364,34 @@ async fn post_process_transcription(
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if !apple_intelligence::check_apple_intelligence_availability() {
             debug!("Apple Intelligence selected but not currently available on this device");
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::PostProcessSkipped {
+                        reason: crate::managers::stats::trace::SkipReason::ProviderUnavailable,
+                    },
+                );
+            }
             return None;
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             debug!("Apple Intelligence provider selected on unsupported platform");
+            if let Some(t) = &trace {
+                t.event(
+                    Instant::now(),
+                    Event::PostProcessSkipped {
+                        reason: crate::managers::stats::trace::SkipReason::ProviderUnavailable,
+                    },
+                );
+            }
             return None;
         }
     }
 
+    #[cfg(test)]
     let started = Instant::now();
+    let mut phase = trace.as_ref().map(|t| t.begin(PhaseKind::PostProcess));
     let text = async {
         if provider.supports_structured_output {
             debug!("Using structured outputs for provider '{}'", provider.id);
@@ -291,11 +404,23 @@ async fn post_process_transcription(
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
                     let token_limit = model.trim().parse::<i32>().unwrap_or(0);
-                    return match apple_intelligence::process_text_with_system_prompt(
+                    let attempt = trace.as_ref().map(|t| t.begin(PhaseKind::PostProcessAttempt));
+                    let result = apple_intelligence::process_text_with_system_prompt(
                         &system_prompt,
                         &user_content,
                         token_limit,
-                    ) {
+                    );
+                    if let (Some(t), Some(id)) = (&trace, attempt) {
+                        t.end(
+                            id,
+                            if result.is_ok() {
+                                PhaseOutcome::Success
+                            } else {
+                                PhaseOutcome::Failed
+                            },
+                        );
+                    }
+                    return match result {
                         Ok(result) => {
                             if result.trim().is_empty() {
                                 debug!("Apple Intelligence returned an empty response");
@@ -338,7 +463,7 @@ async fn post_process_transcription(
                 user_content,
                 Some(system_prompt),
                 Some(json_schema),
-                disable_reasoning,
+                crate::llm_client::CompletionOptions{disable_reasoning,trace:trace.clone()},
             )
             .await
             {
@@ -380,6 +505,8 @@ async fn post_process_transcription(
                         "Structured output failed for provider '{}': {}. Falling back to legacy mode.",
                         provider.id, e
                     );
+                    if let (Some(t),Some(id))=(&trace,phase){t.end(id,PhaseOutcome::Failed);t.event(Instant::now(),Event::PostProcessFallback);}
+                    phase=trace.as_ref().map(|t|t.begin(PhaseKind::PostProcess));
                     // Fall through to legacy mode below
                 }
             }
@@ -394,7 +521,7 @@ async fn post_process_transcription(
             api_key,
             &model,
             processed_prompt,
-            disable_reasoning,
+            crate::llm_client::CompletionOptions{disable_reasoning,trace:trace.clone()},
         )
         .await
         {
@@ -422,8 +549,19 @@ async fn post_process_transcription(
         }
     }
     .await;
+    if let (Some(t), Some(id)) = (&trace, phase) {
+        t.end(
+            id,
+            if text.is_some() {
+                PhaseOutcome::Success
+            } else {
+                PhaseOutcome::Failed
+            },
+        );
+    }
     Some(PostProcessAttempt {
         text,
+        #[cfg(test)]
         elapsed: started.elapsed(),
     })
 }
@@ -432,7 +570,6 @@ pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
-    pub post_process_elapsed: Option<Duration>,
 }
 
 pub(crate) async fn process_transcription_output(
@@ -441,14 +578,22 @@ pub(crate) async fn process_transcription_output(
     post_process: bool,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
+    process_transcription_output_traced(&settings, transcription, post_process, None).await
+}
+async fn process_transcription_output_traced(
+    settings: &AppSettings,
+    transcription: &str,
+    post_process: bool,
+    trace: Option<TraceReporter>,
+) -> ProcessedTranscription {
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
-    let mut post_process_elapsed = None;
 
     if post_process {
-        if let Some(attempt) = post_process_transcription(&settings, &final_text).await {
-            post_process_elapsed = Some(attempt.elapsed);
+        if let Some(attempt) =
+            post_process_transcription_traced(settings, &final_text, trace.clone()).await
+        {
             if let Some(processed_text) = attempt.text {
                 post_processed_text = Some(processed_text.clone());
                 final_text = processed_text;
@@ -466,16 +611,86 @@ pub(crate) async fn process_transcription_output(
         }
     }
 
+    if !post_process {
+        if let Some(t) = trace {
+            t.event(
+                Instant::now(),
+                Event::PostProcessSkipped {
+                    reason: crate::managers::stats::trace::SkipReason::NotRequested,
+                },
+            );
+        }
+    }
     ProcessedTranscription {
         final_text,
         post_processed_text,
         post_process_prompt,
-        post_process_elapsed,
+    }
+}
+
+fn refresh_stage_config(run: &mut RunOwner, settings: &AppSettings, requested: bool, llm: bool) {
+    let fresh = requested_config(settings, &settings.selected_model, requested);
+    if llm {
+        run.config.retain(|key, _| !key.starts_with("post_process"));
+    }
+    for (key, value) in fresh {
+        if (llm && key.starts_with("post_process"))
+            || (!llm
+                && matches!(
+                    key.as_str(),
+                    "paste_method"
+                        | "paste_delay_ms"
+                        | "paste_delay_after_ms"
+                        | "auto_submit"
+                        | "auto_submit_key"
+                        | "clipboard_handling"
+                        | "reliable_paste"
+                        | "append_trailing_space"
+                        | "typing_tool"
+                ))
+        {
+            run.config.insert(key, value);
+        }
     }
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, triggered_at: Instant) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, triggered_at: Instant) {
+        let _ = self.start_impl(app, binding_id, shortcut_str, triggered_at, None);
+    }
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, triggered_at: Instant) {
+        self.stop_impl(app, binding_id, shortcut_str, triggered_at, None);
+    }
+    fn start_traced(
+        &self,
+        app: &AppHandle,
+        binding_id: &str,
+        shortcut_str: &str,
+        triggered_at: Instant,
+        trace: TraceReporter,
+    ) -> Option<TerminalOutcome> {
+        self.start_impl(app, binding_id, shortcut_str, triggered_at, Some(trace))
+    }
+    fn stop_traced(
+        &self,
+        app: &AppHandle,
+        binding_id: &str,
+        shortcut_str: &str,
+        triggered_at: Instant,
+        run: RunOwner,
+    ) {
+        self.stop_impl(app, binding_id, shortcut_str, triggered_at, Some(run));
+    }
+}
+impl TranscribeAction {
+    fn start_impl(
+        &self,
+        app: &AppHandle,
+        binding_id: &str,
+        _shortcut_str: &str,
+        _triggered_at: Instant,
+        trace: Option<TraceReporter>,
+    ) -> Option<TerminalOutcome> {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -485,10 +700,12 @@ impl ShortcutAction for TranscribeAction {
 
         // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
-        tm.initiate_model_load();
+        tm.initiate_model_load_traced(trace.clone());
         let rm_clone = Arc::clone(&rm);
+        let vad_trace = trace.clone();
         std::thread::spawn(move || {
-            if let Err(e) = rm_clone.preload_vad() {
+            let result = rm_clone.preload_vad_traced(vad_trace.as_ref());
+            if let Err(e) = result {
                 debug!("VAD pre-load failed: {}", e);
             }
         });
@@ -503,7 +720,7 @@ impl ShortcutAction for TranscribeAction {
                 .get_model_path(&selected_model)
             {
                 warn!("Not starting recording: no model can transcribe it ({})", e);
-                return;
+                return Some(TerminalOutcome::ProcessingFailed);
             }
         }
 
@@ -517,14 +734,6 @@ impl ShortcutAction for TranscribeAction {
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
-        let mut config = config_snapshot(&settings, &settings.selected_model);
-        config.insert(
-            "post_process".into(),
-            (self.post_process && settings.post_process_enabled).to_string(),
-        );
-        app.state::<Arc<StatsManager>>()
-            .begin_run(config, triggered_at);
-
         let selected_model_info = app
             .state::<Arc<ModelManager>>()
             .get_model_info(&settings.selected_model);
@@ -551,7 +760,7 @@ impl ShortcutAction for TranscribeAction {
             long_form: false,
         };
         if live_decode(expected_model, settings.long_form_chunking) != LiveDecode::None {
-            tm.start_stream();
+            tm.start_stream_traced(trace.clone());
         }
         let plan_elapsed = plan_started.elapsed();
 
@@ -577,7 +786,10 @@ impl ShortcutAction for TranscribeAction {
 
         let mut recording_error: Option<anyhow::Error> = None;
         let recording_start_time = Instant::now();
-        match rm.try_start_recording(&binding_id, vad_policy) {
+        if let Some(t) = &trace {
+            t.event(recording_start_time, Event::RecordingRequested);
+        }
+        match rm.try_start_recording(&binding_id, vad_policy, trace.as_ref()) {
             Ok(readiness) => {
                 debug!(
                     "Recording request accepted in {:?}; waiting for first microphone samples",
@@ -633,6 +845,7 @@ impl ShortcutAction for TranscribeAction {
             }
         }
 
+        let startup_failed = recording_error.is_some();
         if recording_error.is_none() {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
@@ -657,10 +870,21 @@ impl ShortcutAction for TranscribeAction {
             "TranscribeAction::start completed in {:?}",
             start_time.elapsed()
         );
+        startup_failed.then_some(TerminalOutcome::CaptureFailed)
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, triggered_at: Instant) {
-        let started_stats = app.state::<Arc<StatsManager>>().take_run();
+    fn stop_impl(
+        &self,
+        app: &AppHandle,
+        binding_id: &str,
+        _shortcut_str: &str,
+        triggered_at: Instant,
+        mut stats: Option<RunOwner>,
+    ) {
+        if let Some(run) = stats.as_mut() {
+            run.set_stop(triggered_at);
+        }
+        let trace = stats.as_ref().map(RunOwner::reporter);
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
@@ -711,8 +935,10 @@ impl ShortcutAction for TranscribeAction {
 
             let stop_recording_time = Instant::now();
             if let Some(recording) = rm.stop_recording(&binding_id, cancel_generation) {
-                let mut stats = started_stats
-                    .map(|run| run.captured(recording.first_audio, recording.speech_detected));
+                let capture_failed = recording.capture.capture_failed;
+                if let Some(run) = stats.as_mut() {
+                    run.captured(recording.capture);
+                }
                 let input_silent = recording.input_silent;
                 let samples = recording.samples;
                 debug!(
@@ -726,16 +952,24 @@ impl ShortcutAction for TranscribeAction {
                     tm.cancel_stream();
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
+                    if let Some(run) = stats.take() {
+                        run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                    }
                     return;
                 }
 
                 if samples.is_empty() {
-                    debug!("Recording produced no audio samples; skipping persistence");
+                    debug!("Recording produced no audio samples; retaining capture diagnostics");
                     // Tear down any streaming worker so its channel doesn't leak
                     // and block the next start_stream.
                     tm.cancel_stream();
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
+                    if capture_failed {
+                        if let Some(run) = stats.take() {
+                            run.finish(TerminalOutcome::CaptureFailed, Instant::now(), None);
+                        }
+                    }
                     finish_dictation(&ah, empty_outcome(input_silent), 0, stop_time, stats);
                 } else {
                     // Save WAV concurrently with transcription
@@ -744,8 +978,22 @@ impl ShortcutAction for TranscribeAction {
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_path_for_verify = wav_path.clone();
                     let samples_for_wav = samples.clone();
+                    let wav_trace = trace.clone();
                     let wav_handle = tauri::async_runtime::spawn_blocking(move || {
-                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                        let phase = wav_trace.as_ref().map(|t| t.begin(PhaseKind::WavWrite));
+                        let result =
+                            crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav);
+                        if let (Some(t), Some(id)) = (&wav_trace, phase) {
+                            t.end(
+                                id,
+                                if result.is_ok() {
+                                    PhaseOutcome::Success
+                                } else {
+                                    PhaseOutcome::Failed
+                                },
+                            );
+                        }
+                        result
                     });
 
                     // Transcribe concurrently with WAV save: the live decode's
@@ -753,15 +1001,28 @@ impl ShortcutAction for TranscribeAction {
                     // otherwise a batch run of the samples. A cancel is surfaced
                     // as an error, so it never starts a batch run.
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe_recording(samples);
+                    let transcription_result =
+                        tm.transcribe_recording_traced(samples, trace.clone());
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
                         Ok(Ok(())) => {
-                            match crate::audio_toolkit::verify_wav_file(
+                            let phase = trace.as_ref().map(|t| t.begin(PhaseKind::WavVerify));
+                            let result = crate::audio_toolkit::verify_wav_file(
                                 &wav_path_for_verify,
                                 sample_count,
-                            ) {
+                            );
+                            if let (Some(t), Some(id)) = (&trace, phase) {
+                                t.end(
+                                    id,
+                                    if result.is_ok() {
+                                        PhaseOutcome::Success
+                                    } else {
+                                        PhaseOutcome::Failed
+                                    },
+                                );
+                            }
+                            match result {
                                 Ok(()) => true,
                                 Err(e) => {
                                     error!("WAV verification failed: {}", e);
@@ -783,6 +1044,9 @@ impl ShortcutAction for TranscribeAction {
                         debug!("Transcription operation cancelled before output handling");
                         utils::hide_recording_overlay(&ah);
                         set_tray_state(&ah, TrayIconState::Idle);
+                        if let Some(run) = stats.take() {
+                            run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                        }
                         return;
                     }
 
@@ -801,11 +1065,6 @@ impl ShortcutAction for TranscribeAction {
                                 if let Some(model_id) = model_id {
                                     stats.config.insert("model".into(), model_id);
                                 }
-                                stats.result = if is_blank_transcription(&transcription) {
-                                    RunResult::Empty
-                                } else {
-                                    RunResult::Text
-                                };
                                 stats.language = run_language(
                                     language.as_ref(),
                                     &stats.config["selected_language"],
@@ -819,8 +1078,17 @@ impl ShortcutAction for TranscribeAction {
                                     show_processing_overlay(&ah);
                                 }
                             }
+                            let processing_settings = get_settings(&ah);
+                            if let Some(run) = stats.as_mut() {
+                                refresh_stage_config(run, &processing_settings, post_process, true);
+                            }
                             let Some(processed) = complete_unless_cancelled(
-                                process_transcription_output(&ah, &transcription, post_process),
+                                process_transcription_output_traced(
+                                    &processing_settings,
+                                    &transcription,
+                                    post_process,
+                                    trace.clone(),
+                                ),
                                 || rm.was_cancelled_since(cancel_generation),
                             )
                             .await
@@ -828,6 +1096,9 @@ impl ShortcutAction for TranscribeAction {
                                 debug!("Transcription operation cancelled during output handling");
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
+                                if let Some(run) = stats.take() {
+                                    run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                                }
                                 return;
                             };
 
@@ -835,33 +1106,40 @@ impl ShortcutAction for TranscribeAction {
                                 debug!("Transcription operation cancelled before paste");
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
+                                if let Some(run) = stats.take() {
+                                    run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                                }
                                 return;
-                            }
-
-                            if let Some(stats) = stats.as_mut() {
-                                stats.post_process_ms = processed
-                                    .post_process_elapsed
-                                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0);
                             }
 
                             // Save to history if WAV was saved
                             if wav_saved {
-                                if let Err(err) = hm.save_entry(
+                                let phase =
+                                    trace.as_ref().map(|t| t.begin(PhaseKind::HistoryWrite));
+                                let result = hm.save_entry(
                                     file_name,
                                     transcription,
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
                                     language,
-                                ) {
+                                );
+                                if let (Some(t), Some(id)) = (&trace, phase) {
+                                    t.end(
+                                        id,
+                                        if result.is_ok() {
+                                            PhaseOutcome::Success
+                                        } else {
+                                            PhaseOutcome::Failed
+                                        },
+                                    );
+                                }
+                                if let Err(err) = result {
                                     error!("Failed to save history entry: {}", err);
                                 }
                             }
 
                             if processed.final_text.is_empty() {
-                                if let Some(stats) = stats.as_mut() {
-                                    stats.result = RunResult::Empty;
-                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 finish_dictation(
@@ -879,66 +1157,91 @@ impl ShortcutAction for TranscribeAction {
                                 // Taken before the paste thread exists, and so
                                 // before the next session can start.
                                 let session = RECORDING_SESSION.load(Ordering::SeqCst);
-                                let stats_on_spawn_failure = stats.clone();
-                                // Off the main thread: paste sleeps between steps, and a
-                                // paste into Handy's own windows needs the main thread free.
-                                std::thread::Builder::new()
+                                let stats_slot = Arc::new(std::sync::Mutex::new(stats.take()));
+                                let stats_for_output = Arc::clone(&stats_slot);
+                                let trace_for_output = trace.clone();
+                                let spawn = std::thread::Builder::new()
                                     .name("paste".into())
                                     .spawn(move || {
+                                        let mut run = stats_for_output
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner())
+                                            .take();
                                         if rm_for_paste.was_cancelled_since(cancel_generation) {
-                                            debug!(
-                                                "Transcription operation cancelled before paste"
-                                            );
-                                            utils::hide_recording_overlay(&ah_clone);
-                                            set_tray_state(&ah_clone, TrayIconState::Idle);
+                                            if let Some(run) = run.take() {
+                                                run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                                            }
                                             return;
                                         }
-
-                                        let outcome =
-                                            match utils::paste(final_text, ah_clone.clone()) {
-                                                Ok(()) => {
-                                                    debug!(
-                                                        "Text pasted successfully in {:?}",
-                                                        paste_time.elapsed()
-                                                    );
-                                                    TranscriptionOutcome::Typed
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to paste transcription: {}", e);
-                                                    let _ = ah_clone.emit("paste-error", ());
-                                                    TranscriptionOutcome::Failed
-                                                }
-                                            };
-                                        if rm_for_paste.was_cancelled_since(cancel_generation) {
-                                            return;
+                                        let settings = get_settings(&ah_clone);
+                                        if let Some(run) = run.as_mut() {
+                                            refresh_stage_config(run, &settings, post_process, false);
                                         }
-                                        // A new session may have started while
-                                        // this paste ran; the UI is now its.
+                                        let settlement = match trace_for_output {
+                                            Some(trace) => crate::clipboard::paste_with_receipt(
+                                                final_text,
+                                                ah_clone.clone(),
+                                                trace,
+                                                settings,
+                                            ).wait(),
+                                            None => {
+                                                let result = utils::paste(final_text, ah_clone.clone());
+                                                OutputSettlement {
+                                                    at: Instant::now(),
+                                                    kind: OutputKind::ClipboardPaste,
+                                                    result: match result {
+                                                        Ok(()) => OutputResult::Completed(CompletionBasis::SynchronousOutputReturn),
+                                                        Err(_) => OutputResult::Failed(OutputFailure::Other),
+                                                    },
+                                                }
+                                            }
+                                        };
+                                        let terminal = match settlement.result {
+                                            OutputResult::Completed(_) => TerminalOutcome::OutputCompleted,
+                                            OutputResult::Unconfirmed(_) => TerminalOutcome::OutputUnconfirmed,
+                                            OutputResult::Failed(_) => TerminalOutcome::OutputFailed,
+                                            OutputResult::NotRequested => TerminalOutcome::NoOutputRequested,
+                                        };
+                                        let outcome = match settlement.result {
+                                            OutputResult::Completed(_) | OutputResult::NotRequested => TranscriptionOutcome::Typed,
+                                            _ => TranscriptionOutcome::Failed,
+                                        };
+                                        if let Some(run) = run.take() {
+                                            run.finish(terminal, settlement.at, Some(settlement));
+                                        }
+                                        if outcome == TranscriptionOutcome::Failed {
+                                            let _ = ah_clone.emit("paste-error", ());
+                                        }
+                                        debug!("Output settled after {:?}", paste_time.elapsed());
                                         if RECORDING_SESSION.load(Ordering::SeqCst) == session {
                                             utils::hide_recording_overlay(&ah_clone);
                                             set_tray_state(&ah_clone, TrayIconState::Idle);
                                         }
-                                        finish_dictation(
-                                            &ah_clone,
-                                            outcome,
-                                            sample_count,
-                                            stop_time,
-                                            stats,
-                                        );
-                                    })
-                                    .map(|_| ())
-                                    .unwrap_or_else(|e| {
-                                        error!("Failed to start the paste thread: {:?}", e);
-                                        utils::hide_recording_overlay(&ah);
-                                        set_tray_state(&ah, TrayIconState::Idle);
-                                        finish_dictation(
-                                            &ah,
-                                            TranscriptionOutcome::Failed,
-                                            sample_count,
-                                            stop_time,
-                                            stats_on_spawn_failure,
+                                        finish_dictation_at(
+                                            &ah_clone, outcome, sample_count, stop_time, None, settlement.at,
                                         );
                                     });
+                                if let Err(error) = spawn {
+                                    error!("Failed to start paste thread: {error}");
+                                    if let Some(run) =
+                                        stats_slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+                                    {
+                                        run.finish(
+                                            TerminalOutcome::OutputFailed,
+                                            Instant::now(),
+                                            None,
+                                        );
+                                    }
+                                    utils::hide_recording_overlay(&ah);
+                                    set_tray_state(&ah, TrayIconState::Idle);
+                                    finish_dictation(
+                                        &ah,
+                                        TranscriptionOutcome::Failed,
+                                        sample_count,
+                                        stop_time,
+                                        None,
+                                    );
+                                }
                             }
                         }
                         Err(err) => {
@@ -948,6 +1251,9 @@ impl ShortcutAction for TranscribeAction {
                                 );
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
+                                if let Some(run) = stats.take() {
+                                    run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                                }
                                 return;
                             }
 
@@ -957,14 +1263,27 @@ impl ShortcutAction for TranscribeAction {
                             let _ = ah.emit("transcription-error", err.to_string());
                             // Save entry with empty text so user can retry
                             if wav_saved {
-                                if let Err(save_err) = hm.save_entry(
+                                let phase =
+                                    trace.as_ref().map(|t| t.begin(PhaseKind::HistoryWrite));
+                                let result = hm.save_entry(
                                     file_name,
                                     String::new(),
                                     post_process,
                                     None,
                                     None,
                                     None,
-                                ) {
+                                );
+                                if let (Some(t), Some(id)) = (&trace, phase) {
+                                    t.end(
+                                        id,
+                                        if result.is_ok() {
+                                            PhaseOutcome::Success
+                                        } else {
+                                            PhaseOutcome::Failed
+                                        },
+                                    );
+                                }
+                                if let Err(save_err) = result {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
                             }
@@ -986,7 +1305,15 @@ impl ShortcutAction for TranscribeAction {
                 tm.cancel_stream();
                 utils::hide_recording_overlay(&ah);
                 set_tray_state(&ah, TrayIconState::Idle);
+                if rm.was_cancelled_since(cancel_generation) {
+                    if let Some(run) = stats.take() {
+                        run.finish(TerminalOutcome::Cancelled, Instant::now(), None);
+                    }
+                }
                 if !rm.was_cancelled_since(cancel_generation) {
+                    if let Some(run) = stats.take() {
+                        run.finish(TerminalOutcome::CaptureFailed, Instant::now(), None);
+                    }
                     finish_dictation(&ah, TranscriptionOutcome::Empty, 0, stop_time, None);
                 }
             }
@@ -1008,9 +1335,9 @@ impl ShortcutAction for CancelAction {
         app: &AppHandle,
         _binding_id: &str,
         _shortcut_str: &str,
-        _triggered_at: Instant,
+        triggered_at: Instant,
     ) {
-        utils::cancel_current_operation(app);
+        utils::cancel_current_operation_at(app, triggered_at);
     }
 
     fn stop(
@@ -1097,11 +1424,17 @@ mod tests {
             .await
             .is_none());
 
-        for (success, structured) in [(true, false), (false, false), (true, true)] {
+        for (success, structured, reasoning) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            settings.post_process_provider_id = "timing-test".into();
+            let provider_id = if reasoning { "custom" } else { "timing-test" };
+            settings.post_process_provider_id = provider_id.into();
             settings.post_process_providers = vec![PostProcessProvider {
-                id: "timing-test".into(),
+                id: provider_id.into(),
                 label: "Timing test".into(),
                 base_url: format!("http://{}", listener.local_addr().unwrap()),
                 allow_base_url_edit: true,
@@ -1111,11 +1444,11 @@ mod tests {
             }];
             settings
                 .post_process_models
-                .insert("timing-test".into(), "test".into());
+                .insert(provider_id.into(), "test".into());
             settings.post_process_selected_prompt_id =
                 Some(settings.post_process_prompts[0].id.clone());
             let server = tokio::spawn(async move {
-                for request_index in 0..if structured { 2 } else { 1 } {
+                for request_index in 0..if structured || reasoning { 2 } else { 1 } {
                     let (stream, _) = listener.accept().await.unwrap();
                     let mut stream = BufReader::new(stream);
                     let mut content_length = 0;
@@ -1134,26 +1467,115 @@ mod tests {
                     let mut body = vec![0_u8; content_length];
                     stream.read_exact(&mut body).await.unwrap();
                     tokio::time::sleep(Duration::from_millis(30)).await;
-                    let (status, body) = if success && (!structured || request_index > 0) {
-                        (
-                            "200 OK",
-                            r#"{"choices":[{"message":{"content":"Cleaned"}}]}"#,
-                        )
-                    } else {
-                        ("400 Bad Request", r#"{"error":{"message":"test failure"}}"#)
-                    };
+                    let (status, body) =
+                        if success && (!(structured || reasoning) || request_index > 0) {
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"message":{"content":"Cleaned"}}]}"#,
+                            )
+                        } else {
+                            ("400 Bad Request", r#"{"error":{"message":"test failure"}}"#)
+                        };
                     stream.write_all(format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
                 ).as_bytes()).await.unwrap();
                 }
             });
-            let attempt = super::post_process_transcription(&settings, "hello")
-                .await
-                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let stats = Arc::new(crate::managers::stats::StatsManager::test_at(
+                dir.path().join("stats.db"),
+            ));
+            let mut run = stats.begin(
+                stats.input_stamp(crate::managers::stats::trace::InputOrigin::ExternalCommand),
+                crate::managers::stats::requested_config(&settings, "test", true),
+            );
+            run.set_stop(std::time::Instant::now());
+            let attempt =
+                super::post_process_transcription_traced(&settings, "hello", Some(run.reporter()))
+                    .await
+                    .unwrap();
+            let done = std::time::Instant::now();
+            run.finish(
+                crate::managers::stats::trace::TerminalOutcome::OutputCompleted,
+                done,
+                Some(crate::managers::stats::trace::OutputSettlement {
+                    at: done,
+                    kind: crate::managers::stats::trace::OutputKind::DirectTyping,
+                    result: crate::managers::stats::trace::OutputResult::Completed(
+                        crate::managers::stats::trace::CompletionBasis::DirectTypingReturn,
+                    ),
+                }),
+            );
+            stats.shutdown().unwrap();
+            let json = std::fs::read_to_string(stats.trace_path()).unwrap();
+            let trace: crate::managers::stats::trace::FinalizedTrace =
+                serde_json::from_str(json.trim()).unwrap();
+            assert_eq!(
+                trace.post_process.attempts,
+                if structured || reasoning { 2 } else { 1 }
+            );
+            assert_eq!(trace.post_process.attempted, Some(true));
+            assert!(trace.metrics.output_gap.us.unwrap() >= attempt.elapsed.as_micros() as i64);
+            assert!(!json.contains("127.0.0.1"));
+            assert!(!json.contains("hello"));
             server.await.unwrap();
-            assert!(attempt.elapsed >= Duration::from_millis(if structured { 60 } else { 30 }));
+            assert!(
+                attempt.elapsed
+                    >= Duration::from_millis(if structured || reasoning { 60 } else { 30 })
+            );
             assert_eq!(attempt.text.as_deref(), success.then_some("Cleaned"));
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_api_header_does_not_record_an_llm_attempt() {
+        use crate::managers::stats::trace::{FinalizedTrace, InputOrigin, TerminalOutcome};
+        use crate::managers::stats::StatsManager;
+        use crate::settings::{get_default_settings, PostProcessApiFormat, PostProcessProvider};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut settings = get_default_settings();
+        let provider_id = "invalid-header-test";
+        settings.post_process_provider_id = provider_id.into();
+        settings.post_process_providers = vec![PostProcessProvider {
+            id: provider_id.into(),
+            label: "Invalid header test".into(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            allow_base_url_edit: true,
+            models_endpoint: None,
+            supports_structured_output: false,
+            api_format: PostProcessApiFormat::OpenAi,
+        }];
+        settings
+            .post_process_models
+            .insert(provider_id.into(), "test".into());
+        settings
+            .post_process_api_keys
+            .insert(provider_id.into(), "invalid\nheader".into());
+        settings.post_process_selected_prompt_id =
+            Some(settings.post_process_prompts[0].id.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let stats = Arc::new(StatsManager::test_at(dir.path().join("stats.db")));
+        let run = stats.begin(
+            stats.input_stamp(InputOrigin::ExternalCommand),
+            crate::managers::stats::requested_config(&settings, "test", true),
+        );
+        let result =
+            super::post_process_transcription_traced(&settings, "hello", Some(run.reporter()))
+                .await
+                .unwrap();
+        assert!(result.text.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        run.finish(TerminalOutcome::Empty, std::time::Instant::now(), None);
+        stats.shutdown().unwrap();
+        let json = std::fs::read_to_string(stats.trace_path()).unwrap();
+        let trace: FinalizedTrace = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(trace.post_process.attempted, Some(false));
+        assert_eq!(trace.post_process.attempts, 0);
+        assert_eq!(trace.post_process.outcome, "failed_original_text_fallback");
     }
 
     #[test]

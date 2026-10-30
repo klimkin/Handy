@@ -866,15 +866,13 @@
     },
     "statistics": {
       "title": "Statistics",
-      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "description": "فجوات الإملاء ونتائجه محليًا.",
       "metric": {
         "label": "Metric",
-        "entry": "Entry",
-        "exit": "Exit",
-        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
-        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
-        "postProcess": "Post-processing",
-        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+        "captureGap": "فجوة الالتقاط",
+        "outputGap": "تأخر الإخراج",
+        "captureGapHint": "الصوت المفقود بعد التنشيط وقبل VAD. عند غياب طوابع زمنية للعينات أو تغطية متصلة تكون القيمة مجهولة، وليست صفرًا. وقت وصول الكتلة ليس وقت التقاطها.",
+        "outputGapHint": "من إشارة الإيقاف الأصلية إلى اكتمال الإخراج، بما في ذلك LLM والتأخيرات واستعادة الحافظة. الاكتمال لا يثبت عرض النص في التطبيق المستهدف."
       },
       "sort": {
         "label": "Sort",
@@ -894,7 +892,7 @@
       },
       "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
       "failureTitle": "{{failures}} of {{runs}} runs failed",
-      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "legend": "الشوارب تعرض الحدين الأدنى والأقصى، والصندوق يعرض وسط 50٪ من القياسات (Q1–Q3)، والخط يعرض الوسيط، والمعين يعرض المتوسط.",
       "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
       "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
       "loadError": "Couldn't load statistics: {{error}}",
@@ -942,10 +940,18 @@
         "paste_delay_after_ms": "Post-paste delay (ms)",
         "extra_recording_buffer_ms": "Post-stop buffer (ms)",
         "post_process_provider": "Post-processing provider",
-        "post_process_model": "Post-processing model"
+        "post_process_model": "Post-processing model",
+        "post_process_prompt_sha256": "بصمة التعليمة",
+        "post_process_prompt": "معرّف التعليمة",
+        "auto_submit": "إرسال تلقائي",
+        "auto_submit_key": "مفتاح الإرسال التلقائي",
+        "clipboard_handling": "التعامل مع الحافظة",
+        "append_trailing_space": "إضافة مسافة تابعة",
+        "typing_tool": "أداة الكتابة",
+        "reliable_paste": "لصق موثوق"
       },
       "noTiming": "No timing samples yet",
-      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "samplingHint": "تستبعد القياسات الإلغاءات. قد يبقى الالتقاط صالحًا بعد فشل المعالجة؛ يتطلب الإخراج اكتمالًا مؤكدًا. الإلغاءات ليست إخفاقات. تُحفظ الإعدادات عند التنشيط؛ وتُفصل اللغات غير المكتشفة.",
       "scale": {
         "label": "Shared scale",
         "fit": "Fit data",
@@ -955,7 +961,16 @@
         "zoomOut": "Zoom out",
         "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
       },
-      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
+      "legacyTimingHint": "تم الاحتفاظ بـ {{runs}} عملية قديمة واستبعادها من هذه المقاييس. سيوفر الإملاء الجديد قياسات جديدة.",
+      "samples": "{{samples}} مقاسة · {{missing}} غير متاحة · {{cancellations}} ملغاة",
+      "trace": {
+        "title": "ملف الأحداث",
+        "copyPath": "نسخ مسار ملف الأحداث",
+        "copied": "تم النسخ",
+        "pending": "عمليات تصدير الأحداث المعلقة: {{runs}}",
+        "error": "فشل تصدير الأحداث: {{error}}",
+        "copyError": "تعذر نسخ المسار: {{error}}"
+      }
     },
     "about": {
       "title": "حول",
