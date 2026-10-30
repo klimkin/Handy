@@ -959,6 +959,7 @@ impl TranscriptionManager {
             return Ok(Transcription {
                 text: String::new(),
                 language: None,
+                model_id: None,
             });
         }
 
@@ -970,6 +971,7 @@ impl TranscriptionManager {
         let language = outcome
             .setup
             .spoken_language(outcome.model_detected_language.as_deref());
+        let model_id = outcome.setup.model_id.clone();
         let final_result = finish_text(outcome, &settings);
 
         let translation_note = if settings.translate_to_english {
@@ -1002,6 +1004,7 @@ impl TranscriptionManager {
         Ok(Transcription {
             text: final_result,
             language: Some(language),
+            model_id,
         })
     }
 
@@ -1091,7 +1094,9 @@ impl TranscriptionManager {
             language.intent(),
             language.source
         );
-        run_setup(info, settings, language)
+        let mut setup = run_setup(info, settings, language);
+        setup.model_id = self.get_current_model();
+        setup
     }
 
     /// The first window of speech in `audio`: silence is always cut out by
@@ -1183,6 +1188,7 @@ struct BatchContext {
 /// A finished transcription.
 pub struct Transcription {
     pub text: String,
+    pub model_id: Option<String>,
     /// The language it ran in and how that was chosen; `None` when there was
     /// no audio to run.
     pub language: Option<LanguageDecision>,
@@ -1221,6 +1227,7 @@ fn finish_text(outcome: RunOutcome, settings: &AppSettings) -> String {
 /// configured on the loaded model, and what post-processing needs to know.
 struct RunSetup {
     run_options: RunOptions,
+    model_id: Option<String>,
     /// The language every run uses, and how it was chosen.
     language: LanguageDecision,
     languages: Vec<String>,
@@ -1330,6 +1337,7 @@ fn run_setup(info: &LoadedInfo, settings: &AppSettings, language: LanguageDecisi
 
     RunSetup {
         run_options,
+        model_id: None,
         language,
         languages,
         applied_language_hint,

@@ -1,4 +1,5 @@
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use handy_recorder::{AudioChunk, Sink};
 
@@ -74,6 +75,10 @@ pub struct CapturedAudio {
     /// Every sample received (pre-VAD) was exactly zero, e.g. a muted mic.
     /// False when no audio arrived at all.
     pub input_silent: bool,
+    /// The VAD judged at least one frame to be speech. False when it was off
+    /// or only failed: the audio kept then is not known to hold speech.
+    pub speech_detected: bool,
+    pub first_audio: Option<Instant>,
     /// The detector the recording borrowed, for the next one.
     pub vad: CaptureVad,
 }
@@ -92,6 +97,8 @@ pub struct CaptureSink {
     ready: Option<mpsc::Sender<()>>,
     samples: Vec<f32>,
     heard_sound: bool,
+    speech_detected: bool,
+    first_audio: Option<Instant>,
 }
 
 /// Spectrum window at 16 kHz: 32 ms, near the overlay's ~30 Hz refresh.
@@ -128,6 +135,8 @@ impl CaptureSink {
             ready: Some(ready),
             samples: Vec::new(),
             heard_sound: false,
+            speech_detected: false,
+            first_audio: None,
         }
     }
 
@@ -159,6 +168,8 @@ impl CaptureSink {
             samples: self.samples,
             // `ready` is spent on the first chunk, so `None` means audio came.
             input_silent: self.ready.is_none() && !self.heard_sound,
+            speech_detected: self.speech_detected,
+            first_audio: self.first_audio,
             vad: self.vad,
         }
     }
@@ -171,6 +182,7 @@ impl CaptureSink {
 
 impl Sink for CaptureSink {
     fn process_chunk(&mut self, chunk: AudioChunk<'_>) {
+        self.first_audio.get_or_insert_with(Instant::now);
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(());
         }
@@ -191,14 +203,13 @@ impl Sink for CaptureSink {
 
         // The detector needs whole frames, so the final chunk goes in with its
         // zero padding; at most one frame of silence reaches the recording.
-        match self
-            .vad
-            .detector
-            .push_frame(chunk.samples)
-            .unwrap_or(VadFrame::Speech(chunk.samples))
-        {
-            VadFrame::Speech(frame) => Self::emit(&mut self.samples, &self.on_audio, frame),
-            VadFrame::Noise => {}
+        match self.vad.detector.push_frame(chunk.samples) {
+            Ok(VadFrame::Speech(frame)) => {
+                self.speech_detected = true;
+                Self::emit(&mut self.samples, &self.on_audio, frame);
+            }
+            Ok(VadFrame::Noise) => {}
+            Err(_) => Self::emit(&mut self.samples, &self.on_audio, chunk.samples),
         }
     }
 }

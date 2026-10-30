@@ -495,8 +495,29 @@ pub struct AudioRecordingManager {
     /// retry re-enumerates. The system-default case is never cached — the
     /// recorder resolves the current default itself.
     cached_device: Arc<Mutex<Option<(String, String)>>>,
-    /// The last recording was all-zero samples, not just audio without speech.
-    last_input_silent: Arc<AtomicBool>,
+}
+
+/// A stopped recording, ready to transcribe.
+pub struct Recording {
+    /// 16 kHz mono audio that passed the VAD policy, padded when under a
+    /// second.
+    pub samples: Vec<f32>,
+    /// Every sample was exactly zero, not just audio without speech.
+    pub input_silent: bool,
+    /// The VAD judged some of it to be speech; false when it was off.
+    pub speech_detected: bool,
+    pub first_audio: Option<Instant>,
+}
+
+impl Recording {
+    fn lost() -> Self {
+        Self {
+            samples: Vec::new(),
+            input_silent: false,
+            speech_detected: false,
+            first_audio: None,
+        }
+    }
 }
 
 impl AudioRecordingManager {
@@ -537,7 +558,6 @@ impl AudioRecordingManager {
             recording_active: Arc::new(AtomicBool::new(false)),
             capture_generation: Arc::new(AtomicU64::new(0)),
             cached_device: Arc::new(Mutex::new(None)),
-            last_input_silent: Arc::new(AtomicBool::new(false)),
         };
 
         // Always-on?  Open immediately.
@@ -932,7 +952,7 @@ impl AudioRecordingManager {
 
     /// Stops the recording on `microphone`, returning its audio and taking
     /// back the detector it borrowed.
-    fn collect_recording(&self, microphone: &OpenMicrophone) -> Vec<f32> {
+    fn collect_recording(&self, microphone: &OpenMicrophone) -> Recording {
         match microphone.recorder.stop() {
             Ok(stopped) => {
                 match &stopped.end_reason {
@@ -953,19 +973,21 @@ impl AudioRecordingManager {
                 }
                 let captured = stopped.sink.finish();
                 self.return_vad(captured.vad);
-                self.last_input_silent
-                    .store(captured.input_silent, Ordering::Release);
-                captured.samples
+                Recording {
+                    samples: captured.samples,
+                    input_silent: captured.input_silent,
+                    speech_detected: captured.speech_detected,
+                    first_audio: captured.first_audio,
+                }
             }
             Err(e) => {
                 // The recording and its detector are lost with the sink.
                 error!("Failed to stop recording: {e}");
-                self.last_input_silent.store(false, Ordering::Release);
                 if e.kind() != ErrorKind::NotRecording {
                     microphone.failed.store(true, Ordering::Release);
                 }
                 *self.vad.lock().unwrap() = VadSlot::Unloaded;
-                Vec::new()
+                Recording::lost()
             }
         }
     }
@@ -1183,16 +1205,11 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire)
     }
 
-    /// Whether the last stopped recording's device sent only digital silence.
-    pub fn last_input_silent(&self) -> bool {
-        self.last_input_silent.load(Ordering::Acquire)
-    }
-
     pub fn was_cancelled_since(&self, generation: u64) -> bool {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
-    pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
+    pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Recording> {
         self.invalidate_recording_readiness();
         let mut state = self.state.lock().unwrap();
 
@@ -1225,12 +1242,11 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let samples = match self.recorder.lock().unwrap().as_ref() {
+                let mut recording = match self.recorder.lock().unwrap().as_ref() {
                     Some(microphone) => self.collect_recording(microphone),
                     None => {
                         error!("Recorder not available");
-                        self.last_input_silent.store(false, Ordering::Release);
-                        Vec::new()
+                        Recording::lost()
                     }
                 };
 
@@ -1252,15 +1268,11 @@ impl AudioRecordingManager {
                 }
 
                 // Pad if very short
-                let s_len = samples.len();
-                // debug!("Got {} samples", s_len);
+                let s_len = recording.samples.len();
                 if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
-                    let mut padded = samples;
-                    padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                    Some(padded)
-                } else {
-                    Some(samples)
+                    recording.samples.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
                 }
+                Some(recording)
             }
             _ => None,
         }

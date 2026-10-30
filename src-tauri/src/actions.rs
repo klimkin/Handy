@@ -5,6 +5,7 @@ use crate::audio_toolkit::VadPolicy;
 use crate::managers::audio::{recording_error_type, AudioRecordingManager};
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
+use crate::managers::stats::{config_snapshot, run_language, RunRecord, RunResult, StatsManager};
 use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTraits};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::{Transcription, TranscriptionManager};
@@ -50,17 +51,26 @@ pub struct TranscriptionCompleteEvent {
     pub wait_seconds: f64,
 }
 
-fn emit_transcription_complete(
+fn finish_dictation(
     app: &AppHandle,
     outcome: TranscriptionOutcome,
     sample_count: usize,
     stop_time: Instant,
+    stats: Option<RunRecord>,
 ) {
+    let wait_seconds = stop_time.elapsed().as_secs_f64();
+    if let Some(mut stats) = stats {
+        stats.release_to_paste_ms = wait_seconds * 1000.0;
+        if outcome == TranscriptionOutcome::Failed {
+            stats.result = RunResult::Error;
+        }
+        app.state::<Arc<StatsManager>>().record_run(&stats);
+    }
     let event = TranscriptionCompleteEvent {
         outcome,
         audio_seconds: sample_count as f64
             / crate::audio_toolkit::constants::WHISPER_SAMPLE_RATE as f64,
-        wait_seconds: stop_time.elapsed().as_secs_f64(),
+        wait_seconds,
     };
     if let Err(e) = event.emit(app) {
         warn!("Failed to emit transcription complete: {e}");
@@ -106,8 +116,8 @@ impl Drop for FinishGuard {
 
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, triggered_at: Instant);
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, triggered_at: Instant);
 }
 
 // Transcribe Action
@@ -175,7 +185,15 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+struct PostProcessAttempt {
+    text: Option<String>,
+    elapsed: Duration,
+}
+
+async fn post_process_transcription(
+    settings: &AppSettings,
+    transcription: &str,
+) -> Option<PostProcessAttempt> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
         return None;
@@ -247,164 +265,174 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     // field the endpoint understands and retries without it if rejected.
     let disable_reasoning = matches!(provider.id.as_str(), "custom" | "openrouter");
 
-    if provider.supports_structured_output {
-        debug!("Using structured outputs for provider '{}'", provider.id);
+    if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if !apple_intelligence::check_apple_intelligence_availability() {
+            debug!("Apple Intelligence selected but not currently available on this device");
+            return None;
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            debug!("Apple Intelligence provider selected on unsupported platform");
+            return None;
+        }
+    }
 
-        let system_prompt = build_system_prompt(&prompt);
-        let user_content = transcription.to_string();
+    let started = Instant::now();
+    let text = async {
+        if provider.supports_structured_output {
+            debug!("Using structured outputs for provider '{}'", provider.id);
 
-        // Handle Apple Intelligence separately since it uses native Swift APIs
-        if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            {
-                if !apple_intelligence::check_apple_intelligence_availability() {
-                    debug!(
-                        "Apple Intelligence selected but not currently available on this device"
-                    );
-                    return None;
+            let system_prompt = build_system_prompt(&prompt);
+            let user_content = transcription.to_string();
+
+            // Handle Apple Intelligence separately since it uses native Swift APIs
+            if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let token_limit = model.trim().parse::<i32>().unwrap_or(0);
+                    return match apple_intelligence::process_text_with_system_prompt(
+                        &system_prompt,
+                        &user_content,
+                        token_limit,
+                    ) {
+                        Ok(result) => {
+                            if result.trim().is_empty() {
+                                debug!("Apple Intelligence returned an empty response");
+                                None
+                            } else {
+                                let result = strip_invisible_chars(&result);
+                                debug!(
+                                    "Apple Intelligence post-processing succeeded. Output length: {} chars",
+                                    result.len()
+                                );
+                                Some(result)
+                            }
+                        }
+                        Err(err) => {
+                            error!("Apple Intelligence post-processing failed: {}", err);
+                            None
+                        }
+                    };
                 }
 
-                let token_limit = model.trim().parse::<i32>().unwrap_or(0);
-                return match apple_intelligence::process_text_with_system_prompt(
-                    &system_prompt,
-                    &user_content,
-                    token_limit,
-                ) {
-                    Ok(result) => {
-                        if result.trim().is_empty() {
-                            debug!("Apple Intelligence returned an empty response");
-                            None
-                        } else {
-                            let result = strip_invisible_chars(&result);
-                            debug!(
-                                "Apple Intelligence post-processing succeeded. Output length: {} chars",
-                                result.len()
-                            );
-                            Some(result)
-                        }
-                    }
-                    Err(err) => {
-                        error!("Apple Intelligence post-processing failed: {}", err);
-                        None
-                    }
-                };
             }
 
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            // Define JSON schema for transcription output
+            let json_schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    (TRANSCRIPTION_FIELD): {
+                        "type": "string",
+                        "description": "The cleaned and processed transcription text"
+                    }
+                },
+                "required": [TRANSCRIPTION_FIELD],
+                "additionalProperties": false
+            });
+
+            match crate::llm_client::send_chat_completion_with_schema(
+                &provider,
+                api_key.clone(),
+                &model,
+                user_content,
+                Some(system_prompt),
+                Some(json_schema),
+                disable_reasoning,
+            )
+            .await
             {
-                debug!("Apple Intelligence provider selected on unsupported platform");
-                return None;
+                Ok(Some(content)) => {
+                    // Parse the JSON response to extract the transcription field
+                    let content = strip_think_block(&content);
+                    match serde_json::from_str::<serde_json::Value>(content) {
+                        Ok(json) => {
+                            if let Some(transcription_value) =
+                                json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
+                            {
+                                let result = strip_invisible_chars(transcription_value);
+                                debug!(
+                                    "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
+                                    provider.id,
+                                    result.len()
+                                );
+                                return Some(result);
+                            } else {
+                                error!("Structured output response missing 'transcription' field");
+                                return Some(strip_invisible_chars(content));
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to parse structured output JSON: {}. Returning raw content.",
+                                e
+                            );
+                            return Some(strip_invisible_chars(content));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    error!("LLM API response has no content");
+                    return None;
+                }
+                Err(e) => {
+                    warn!(
+                        "Structured output failed for provider '{}': {}. Falling back to legacy mode.",
+                        provider.id, e
+                    );
+                    // Fall through to legacy mode below
+                }
             }
         }
 
-        // Define JSON schema for transcription output
-        let json_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                (TRANSCRIPTION_FIELD): {
-                    "type": "string",
-                    "description": "The cleaned and processed transcription text"
-                }
-            },
-            "required": [TRANSCRIPTION_FIELD],
-            "additionalProperties": false
-        });
+        // Legacy mode: Replace ${output} variable in the prompt with the actual text
+        let processed_prompt = prompt.replace("${output}", transcription);
+        debug!("Processed prompt length: {} chars", processed_prompt.len());
 
-        match crate::llm_client::send_chat_completion_with_schema(
+        match crate::llm_client::send_chat_completion(
             &provider,
-            api_key.clone(),
+            api_key,
             &model,
-            user_content,
-            Some(system_prompt),
-            Some(json_schema),
+            processed_prompt,
             disable_reasoning,
         )
         .await
         {
             Ok(Some(content)) => {
-                // Parse the JSON response to extract the transcription field
-                let content = strip_think_block(&content);
-                match serde_json::from_str::<serde_json::Value>(content) {
-                    Ok(json) => {
-                        if let Some(transcription_value) =
-                            json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
-                        {
-                            let result = strip_invisible_chars(transcription_value);
-                            debug!(
-                                "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
-                                provider.id,
-                                result.len()
-                            );
-                            return Some(result);
-                        } else {
-                            error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(content));
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to parse structured output JSON: {}. Returning raw content.",
-                            e
-                        );
-                        return Some(strip_invisible_chars(content));
-                    }
-                }
+                let content = strip_invisible_chars(strip_think_block(&content));
+                debug!(
+                    "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
+                    provider.id,
+                    content.len()
+                );
+                Some(content)
             }
             Ok(None) => {
                 error!("LLM API response has no content");
-                return None;
+                None
             }
             Err(e) => {
-                warn!(
-                    "Structured output failed for provider '{}': {}. Falling back to legacy mode.",
-                    provider.id, e
+                error!(
+                    "LLM post-processing failed for provider '{}': {}. Falling back to original transcription.",
+                    provider.id,
+                    e
                 );
-                // Fall through to legacy mode below
+                None
             }
         }
     }
-
-    // Legacy mode: Replace ${output} variable in the prompt with the actual text
-    let processed_prompt = prompt.replace("${output}", transcription);
-    debug!("Processed prompt length: {} chars", processed_prompt.len());
-
-    match crate::llm_client::send_chat_completion(
-        &provider,
-        api_key,
-        &model,
-        processed_prompt,
-        disable_reasoning,
-    )
-    .await
-    {
-        Ok(Some(content)) => {
-            let content = strip_invisible_chars(strip_think_block(&content));
-            debug!(
-                "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
-                provider.id,
-                content.len()
-            );
-            Some(content)
-        }
-        Ok(None) => {
-            error!("LLM API response has no content");
-            None
-        }
-        Err(e) => {
-            error!(
-                "LLM post-processing failed for provider '{}': {}. Falling back to original transcription.",
-                provider.id,
-                e
-            );
-            None
-        }
-    }
+    .await;
+    Some(PostProcessAttempt {
+        text,
+        elapsed: started.elapsed(),
+    })
 }
 
 pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    pub post_process_elapsed: Option<Duration>,
 }
 
 pub(crate) async fn process_transcription_output(
@@ -416,19 +444,23 @@ pub(crate) async fn process_transcription_output(
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let mut post_process_elapsed = None;
 
     if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
-            post_processed_text = Some(processed_text.clone());
-            final_text = processed_text;
+        if let Some(attempt) = post_process_transcription(&settings, &final_text).await {
+            post_process_elapsed = Some(attempt.elapsed);
+            if let Some(processed_text) = attempt.text {
+                post_processed_text = Some(processed_text.clone());
+                final_text = processed_text;
 
-            if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
-                if let Some(prompt) = settings
-                    .post_process_prompts
-                    .iter()
-                    .find(|prompt| &prompt.id == prompt_id)
-                {
-                    post_process_prompt = Some(prompt.prompt.clone());
+                if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
+                    if let Some(prompt) = settings
+                        .post_process_prompts
+                        .iter()
+                        .find(|prompt| &prompt.id == prompt_id)
+                    {
+                        post_process_prompt = Some(prompt.prompt.clone());
+                    }
                 }
             }
         }
@@ -438,11 +470,12 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+        post_process_elapsed,
     }
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, triggered_at: Instant) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -484,6 +517,13 @@ impl ShortcutAction for TranscribeAction {
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
+        let mut config = config_snapshot(&settings, &settings.selected_model);
+        config.insert(
+            "post_process".into(),
+            (self.post_process && settings.post_process_enabled).to_string(),
+        );
+        app.state::<Arc<StatsManager>>()
+            .begin_run(config, triggered_at);
 
         let selected_model_info = app
             .state::<Arc<ModelManager>>()
@@ -619,7 +659,8 @@ impl ShortcutAction for TranscribeAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, triggered_at: Instant) {
+        let started_stats = app.state::<Arc<StatsManager>>().take_run();
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
@@ -628,7 +669,7 @@ impl ShortcutAction for TranscribeAction {
         // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);
 
-        let stop_time = Instant::now();
+        let stop_time = triggered_at;
         debug!("TranscribeAction::stop called for binding: {}", binding_id);
 
         let ah = app.clone();
@@ -669,10 +710,11 @@ impl ShortcutAction for TranscribeAction {
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) {
-                // Read now: by the time transcribing ends, another take may
-                // have replaced it.
-                let input_silent = rm.last_input_silent();
+            if let Some(recording) = rm.stop_recording(&binding_id, cancel_generation) {
+                let mut stats = started_stats
+                    .map(|run| run.captured(recording.first_audio, recording.speech_detected));
+                let input_silent = recording.input_silent;
+                let samples = recording.samples;
                 debug!(
                     "Recording stopped and samples retrieved in {:?}, sample count: {}",
                     stop_recording_time.elapsed(),
@@ -694,7 +736,7 @@ impl ShortcutAction for TranscribeAction {
                     tm.cancel_stream();
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
-                    emit_transcription_complete(&ah, empty_outcome(input_silent), 0, stop_time);
+                    finish_dictation(&ah, empty_outcome(input_silent), 0, stop_time, stats);
                 } else {
                     // Save WAV concurrently with transcription
                     let sample_count = samples.len();
@@ -748,12 +790,27 @@ impl ShortcutAction for TranscribeAction {
                         Ok(Transcription {
                             text: transcription,
                             language,
+                            model_id,
                         }) => {
                             debug!(
                                 "Transcription completed in {:?}: '{}'",
                                 transcription_time.elapsed(),
                                 utils::redact_text(&transcription)
                             );
+                            if let Some(stats) = stats.as_mut() {
+                                if let Some(model_id) = model_id {
+                                    stats.config.insert("model".into(), model_id);
+                                }
+                                stats.result = if is_blank_transcription(&transcription) {
+                                    RunResult::Empty
+                                } else {
+                                    RunResult::Text
+                                };
+                                stats.language = run_language(
+                                    language.as_ref(),
+                                    &stats.config["selected_language"],
+                                );
+                            }
 
                             if post_process {
                                 if use_streaming_overlay {
@@ -781,6 +838,12 @@ impl ShortcutAction for TranscribeAction {
                                 return;
                             }
 
+                            if let Some(stats) = stats.as_mut() {
+                                stats.post_process_ms = processed
+                                    .post_process_elapsed
+                                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0);
+                            }
+
                             // Save to history if WAV was saved
                             if wav_saved {
                                 if let Err(err) = hm.save_entry(
@@ -796,13 +859,17 @@ impl ShortcutAction for TranscribeAction {
                             }
 
                             if processed.final_text.is_empty() {
+                                if let Some(stats) = stats.as_mut() {
+                                    stats.result = RunResult::Empty;
+                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
-                                emit_transcription_complete(
+                                finish_dictation(
                                     &ah,
                                     empty_outcome(input_silent),
                                     sample_count,
                                     stop_time,
+                                    stats,
                                 );
                             } else {
                                 let ah_clone = ah.clone();
@@ -812,6 +879,7 @@ impl ShortcutAction for TranscribeAction {
                                 // Taken before the paste thread exists, and so
                                 // before the next session can start.
                                 let session = RECORDING_SESSION.load(Ordering::SeqCst);
+                                let stats_on_spawn_failure = stats.clone();
                                 // Off the main thread: paste sleeps between steps, and a
                                 // paste into Handy's own windows needs the main thread free.
                                 std::thread::Builder::new()
@@ -841,17 +909,21 @@ impl ShortcutAction for TranscribeAction {
                                                     TranscriptionOutcome::Failed
                                                 }
                                             };
+                                        if rm_for_paste.was_cancelled_since(cancel_generation) {
+                                            return;
+                                        }
                                         // A new session may have started while
                                         // this paste ran; the UI is now its.
                                         if RECORDING_SESSION.load(Ordering::SeqCst) == session {
                                             utils::hide_recording_overlay(&ah_clone);
                                             set_tray_state(&ah_clone, TrayIconState::Idle);
                                         }
-                                        emit_transcription_complete(
+                                        finish_dictation(
                                             &ah_clone,
                                             outcome,
                                             sample_count,
                                             stop_time,
+                                            stats,
                                         );
                                     })
                                     .map(|_| ())
@@ -859,11 +931,12 @@ impl ShortcutAction for TranscribeAction {
                                         error!("Failed to start the paste thread: {:?}", e);
                                         utils::hide_recording_overlay(&ah);
                                         set_tray_state(&ah, TrayIconState::Idle);
-                                        emit_transcription_complete(
+                                        finish_dictation(
                                             &ah,
                                             TranscriptionOutcome::Failed,
                                             sample_count,
                                             stop_time,
+                                            stats_on_spawn_failure,
                                         );
                                     });
                             }
@@ -897,11 +970,12 @@ impl ShortcutAction for TranscribeAction {
                             }
                             utils::hide_recording_overlay(&ah);
                             set_tray_state(&ah, TrayIconState::Idle);
-                            emit_transcription_complete(
+                            finish_dictation(
                                 &ah,
                                 TranscriptionOutcome::Failed,
                                 sample_count,
                                 stop_time,
+                                stats,
                             );
                         }
                     }
@@ -913,7 +987,7 @@ impl ShortcutAction for TranscribeAction {
                 utils::hide_recording_overlay(&ah);
                 set_tray_state(&ah, TrayIconState::Idle);
                 if !rm.was_cancelled_since(cancel_generation) {
-                    emit_transcription_complete(&ah, TranscriptionOutcome::Empty, 0, stop_time);
+                    finish_dictation(&ah, TranscriptionOutcome::Empty, 0, stop_time, None);
                 }
             }
         });
@@ -929,11 +1003,23 @@ impl ShortcutAction for TranscribeAction {
 struct CancelAction;
 
 impl ShortcutAction for CancelAction {
-    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn start(
+        &self,
+        app: &AppHandle,
+        _binding_id: &str,
+        _shortcut_str: &str,
+        _triggered_at: Instant,
+    ) {
         utils::cancel_current_operation(app);
     }
 
-    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn stop(
+        &self,
+        _app: &AppHandle,
+        _binding_id: &str,
+        _shortcut_str: &str,
+        _triggered_at: Instant,
+    ) {
         // Nothing to do on stop for cancel
     }
 }
@@ -942,7 +1028,7 @@ impl ShortcutAction for CancelAction {
 struct TestAction;
 
 impl ShortcutAction for TestAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _triggered_at: Instant) {
         log::info!(
             "Shortcut ID '{}': Started - {} (App: {})", // Changed "Pressed" to "Started" for consistency
             binding_id,
@@ -951,7 +1037,7 @@ impl ShortcutAction for TestAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _triggered_at: Instant) {
         log::info!(
             "Shortcut ID '{}': Stopped - {} (App: {})", // Changed "Released" to "Stopped" for consistency
             binding_id,
@@ -997,6 +1083,78 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn post_processing_times_actual_success_and_failed_attempts_not_skips() {
+        use crate::settings::{get_default_settings, PostProcessApiFormat, PostProcessProvider};
+        let mut settings = get_default_settings();
+        assert!(super::post_process_transcription(&settings, "")
+            .await
+            .is_none());
+        settings.post_process_provider_id = "missing".into();
+        assert!(super::post_process_transcription(&settings, "hello")
+            .await
+            .is_none());
+
+        for (success, structured) in [(true, false), (false, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            settings.post_process_provider_id = "timing-test".into();
+            settings.post_process_providers = vec![PostProcessProvider {
+                id: "timing-test".into(),
+                label: "Timing test".into(),
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                allow_base_url_edit: true,
+                models_endpoint: None,
+                supports_structured_output: structured,
+                api_format: PostProcessApiFormat::OpenAi,
+            }];
+            settings
+                .post_process_models
+                .insert("timing-test".into(), "test".into());
+            settings.post_process_selected_prompt_id =
+                Some(settings.post_process_prompts[0].id.clone());
+            let server = tokio::spawn(async move {
+                for request_index in 0..if structured { 2 } else { 1 } {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut content_length = 0;
+                    loop {
+                        let mut header = String::new();
+                        assert!(stream.read_line(&mut header).await.unwrap() > 0);
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(length) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = length.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut body = vec![0_u8; content_length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let (status, body) = if success && (!structured || request_index > 0) {
+                        (
+                            "200 OK",
+                            r#"{"choices":[{"message":{"content":"Cleaned"}}]}"#,
+                        )
+                    } else {
+                        ("400 Bad Request", r#"{"error":{"message":"test failure"}}"#)
+                    };
+                    stream.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+                }
+            });
+            let attempt = super::post_process_transcription(&settings, "hello")
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert!(attempt.elapsed >= Duration::from_millis(if structured { 60 } else { 30 }));
+            assert_eq!(attempt.text.as_deref(), success.then_some("Cleaned"));
+        }
+    }
 
     #[test]
     fn blank_transcription_is_detected() {

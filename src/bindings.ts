@@ -1015,10 +1015,28 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
- * Checks if the Mac is a laptop by detecting battery presence
- * 
- * This uses pmset to check for battery information.
- * Returns true if a battery is detected (laptop), false otherwise (desktop)
+ * Every group of runs with its box plot figures, plus the settings in use
+ * now, which each group's settings are compared with.
+ */
+async getStatsSummary() : Promise<Result<StatsSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_stats_summary") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async clearStats() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_stats") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Stub implementation for non-macOS platforms
+ * Always returns false since laptop detection is macOS-specific
  */
 async isLaptop() : Promise<Result<boolean, string>> {
     try {
@@ -1156,6 +1174,11 @@ export type AutoUnavailableReason =
 { kind: "no_match" }
 export type AvailableAccelerators = { transcribe: string[]; gpu_devices: GpuDeviceOption[] }
 export type BindingResponse = { success: boolean; binding: ShortcutBinding | null; error: string | null }
+/**
+ * What one extended box plot draws: the range, the middle half, the median
+ * and the mean.
+ */
+export type BoxStats = { min: number; q1: number; median: number; q3: number; max: number; mean: number }
 /**
  * Script applied to Mandarin and Cantonese output. Traditional carries its region
  * (Taiwan vs Hong Kong forms, e.g. 裡/裏) rather than guessing it.
@@ -1397,6 +1420,34 @@ export type ShortcutActivation =
 "hold_or_toggle"
 export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }
 export type SoundTheme = "marimba" | "pop" | "custom"
+export type StatsGroup = {
+  model: string;
+  language: string | null;
+  variant: number;
+  config: Partial<{ [key in string]: string }>;
+  is_current: boolean;
+  runs: number;
+  failures: number;
+  first_run: number;
+  last_run: number;
+  /**
+   * Key press to first captured audio, including runs where later processing failed.
+   */
+  entry_ms: BoxStats | null;
+  /**
+   * Stop key edge to completed output minus post-processing, successful runs only.
+   */
+  exit_ms: BoxStats | null;
+  /**
+   * Actual post-processing attempts, including failed attempts.
+   */
+  post_process_ms: BoxStats | null;
+  /**
+   * Older runs whose inclusive Exit cannot be separated retrospectively.
+   */
+  legacy_timing_runs: number;
+};
+export type StatsSummary = { current: Partial<{ [key in string]: string }>; groups: StatsGroup[] }
 /**
  * Phase of the streaming overlay card, emitted to drive its UI state.
  */

@@ -3,8 +3,6 @@ use crate::audio_toolkit::vad::{VadFrame, VoiceActivityDetector};
 use handy_recorder::{AudioChunk, Sink};
 use std::sync::{mpsc, Arc, Mutex};
 
-/// Keeps frames whose first sample is non-zero, and records how the sink
-/// configured it.
 #[derive(Default)]
 struct ScriptedVad {
     frame_samples: usize,
@@ -14,6 +12,9 @@ struct ScriptedVad {
 
 impl VoiceActivityDetector for ScriptedVad {
     fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> anyhow::Result<VadFrame<'a>> {
+        if frame[0] < 0.0 {
+            anyhow::bail!("scripted detector failure");
+        }
         Ok(if frame[0] != 0.0 {
             VadFrame::Speech(frame)
         } else {
@@ -87,9 +88,13 @@ fn chunk(samples: &[f32], valid_frames: usize) -> AudioChunk<'_> {
 fn readiness_fires_once_on_the_first_chunk() {
     let mut h = harness(VadPolicy::Disabled);
     assert!(h.ready.try_recv().is_err());
+    assert!(h.sink.first_audio.is_none());
 
     h.sink.process_chunk(chunk(&[0.0; FRAME], FRAME));
+    let first_audio = h.sink.first_audio;
     h.sink.process_chunk(chunk(&[0.0; FRAME], FRAME));
+    assert!(first_audio.is_some());
+    assert_eq!(h.sink.first_audio, first_audio);
 
     assert!(h.ready.try_recv().is_ok());
     // The sender is gone after the first chunk, so a second signal can't come.
@@ -99,7 +104,7 @@ fn readiness_fires_once_on_the_first_chunk() {
 #[test]
 fn readiness_waiter_wakes_when_a_recording_ends_without_audio() {
     let h = harness(VadPolicy::Offline);
-    let _ = h.sink.finish();
+    assert!(h.sink.finish().first_audio.is_none());
     assert!(h.ready.recv().is_err());
 }
 
@@ -156,6 +161,37 @@ fn vad_keeps_speech_frames_only() {
     let expected = [[1.0; FRAME], [2.0; FRAME]].concat();
     assert_eq!(*h.fed.lock().unwrap(), expected);
     assert_eq!(h.sink.finish().samples, expected);
+}
+
+#[test]
+fn only_a_frame_the_detector_judged_speech_is_speech_evidence() {
+    let speech_detected = |policy: VadPolicy, frames: &[[f32; FRAME]]| {
+        let mut h = harness(policy);
+        for frame in frames {
+            h.sink.process_chunk(chunk(frame, FRAME));
+        }
+        let captured = h.sink.finish();
+        (captured.samples.len(), captured.speech_detected)
+    };
+
+    assert_eq!(
+        speech_detected(VadPolicy::Disabled, &[[1.0; FRAME]]),
+        (FRAME, false),
+        "with the VAD off nothing is known about the audio"
+    );
+    assert_eq!(
+        speech_detected(VadPolicy::Offline, &[[0.0; FRAME]]),
+        (0, false)
+    );
+    assert_eq!(
+        speech_detected(VadPolicy::Offline, &[[0.0; FRAME], [1.0; FRAME]]),
+        (FRAME, true)
+    );
+    assert_eq!(
+        speech_detected(VadPolicy::Streaming, &[[-1.0; FRAME]]),
+        (FRAME, false),
+        "a frame the detector failed on is kept but is not speech"
+    );
 }
 
 #[test]

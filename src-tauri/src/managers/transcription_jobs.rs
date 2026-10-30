@@ -296,7 +296,8 @@ impl TranscriptionJobManager {
             cancelled,
             percent: Cell::new(0),
         };
-        let Some(Transcription { text, language }) = tm.transcribe_in_chunks(samples, &control)?
+        let Some(Transcription { text, language, .. }) =
+            tm.transcribe_in_chunks(samples, &control)?
         else {
             return Ok(());
         };

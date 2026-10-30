@@ -16,6 +16,7 @@
     "postProcessing": "עיבוד משלים",
     "history": "היסטוריה",
     "debug": "ניפוי שגיאות",
+    "statistics": "Statistics",
     "about": "אודות"
   },
   "onboarding": {
@@ -862,6 +863,99 @@
         "verdictNoEvents": "לא נקלטו אירועים — האם הקשת על מקשים במהלך הבדיקה?",
         "failed": "האבחון נכשל: {{error}}"
       }
+    },
+    "statistics": {
+      "title": "Statistics",
+      "description": "Model latency and failures on your machine. Each completed run is saved locally, separately from history.",
+      "metric": {
+        "label": "Metric",
+        "entry": "Entry",
+        "exit": "Exit",
+        "entryHint": "Entry: shortcut press to first microphone samples, including input dispatch, device startup and capture buffering.",
+        "exitHint": "Exit: shortcut release to completed paste, minus time spent post-processing. Toggle mode uses the stop press instead.",
+        "postProcess": "Post-processing",
+        "postProcessHint": "Post-processing: actual attempts, including retries and failed attempts that fall back to the original text. Skipped processing does not create a zero sample."
+      },
+      "sort": {
+        "label": "Sort",
+        "speed": "Fastest first",
+        "failures": "Fewest failures first"
+      },
+      "language": {
+        "all": "All languages",
+        "unknown": "Auto (not detected)"
+      },
+      "variant": "Config #{{n}}",
+      "current": "Current",
+      "currentHint": "Same settings as you use now",
+      "columns": {
+        "median": "Median",
+        "failed": "Failed"
+      },
+      "boxSummary": "min {{min}} · Q1 {{q1}} · median {{median}} · Q3 {{q3}} · max {{max}} · mean {{mean}}",
+      "failureTitle": "{{failures}} of {{runs}} runs failed",
+      "legend": "Whiskers show min and max, the box shows the middle 50% (Q1–Q3), the line shows the median and the diamond shows the mean. Failures mean a processing error or empty text after VAD confirmed speech. Cancellations and empty results without confirmed speech are excluded.",
+      "interactionHint": "Click a row to highlight it. Double-click it to see which settings differ from your current ones.",
+      "empty": "No dictations recorded yet. Use Handy for a while and the results will show up here.",
+      "loadError": "Couldn't load statistics: {{error}}",
+      "refresh": "Refresh",
+      "clear": {
+        "button": "Clear statistics",
+        "confirm": "Delete all runs",
+        "cancel": "Cancel"
+      },
+      "details": {
+        "show": "Show settings",
+        "hide": "Hide settings",
+        "hint": "Double-click to compare with your current settings",
+        "title": "Differences from your current settings",
+        "setting": "Setting",
+        "then": "Then",
+        "now": "Now",
+        "same": "These runs used the same settings as now.",
+        "notRecorded": "not recorded",
+        "facts": "{{runs}} runs, {{failures}} failed · {{first}} – {{last}}"
+      },
+      "config": {
+        "on": "On",
+        "off": "Off",
+        "auto": "Auto",
+        "automatic": "Automatic",
+        "model": "Model",
+        "selected_language": "Language",
+        "translate_to_english": "Translate to English",
+        "accelerator": "Accelerator",
+        "gpu_device": "GPU device",
+        "vad_enabled": "Voice activity detection",
+        "vad_backend": "VAD backend",
+        "long_form_chunking": "Long-form chunking",
+        "lazy_stream_close": "Lazy stream close",
+        "language_detection": "Language detection",
+        "model_unload_timeout": "Model unload timeout",
+        "spoken_languages": "Spoken languages",
+        "always_on_microphone": "Always-on microphone",
+        "shortcut_activation": "Shortcut activation",
+        "post_process": "Post-processing",
+        "paste_method": "Paste method",
+        "requested_model": "Selected model",
+        "paste_delay_ms": "Pre-paste delay (ms)",
+        "paste_delay_after_ms": "Post-paste delay (ms)",
+        "extra_recording_buffer_ms": "Post-stop buffer (ms)",
+        "post_process_provider": "Post-processing provider",
+        "post_process_model": "Post-processing model"
+      },
+      "noTiming": "No timing samples yet",
+      "samplingHint": "Entry includes captured runs even if processing later fails; Exit uses successful dictations only. Failures refer to the whole dictation, not just the selected stage. Settings are recorded at recording start. Unresolved auto-language runs stay separate.",
+      "scale": {
+        "label": "Shared scale",
+        "fit": "Fit data",
+        "zero": "From zero",
+        "hint": "Wheel to zoom; drag a plot to pan. Fit data shows all measurements; From zero restores the full scale.",
+        "zoomIn": "Zoom in",
+        "zoomOut": "Zoom out",
+        "clipped": "Some measurements are outside the visible range. Zoom out or choose Fit data."
+      },
+      "legacyTimingHint": "Older runs retain Entry and run counts, but their inclusive Exit cannot be reliably split. New dictations will populate the separated Exit and post-processing measurements."
     },
     "about": {
       "title": "אודות",

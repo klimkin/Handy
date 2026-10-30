@@ -32,6 +32,7 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    let triggered_at = std::time::Instant::now();
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.
@@ -43,6 +44,7 @@ pub fn handle_shortcut_event(
                 is_pressed,
                 settings.shortcut_activation,
                 std::time::Duration::from_millis(settings.hold_threshold_ms),
+                triggered_at,
             );
         } else {
             warn!("TranscriptionCoordinator is not initialized");
@@ -62,15 +64,15 @@ pub fn handle_shortcut_event(
     if binding_id == "cancel" {
         let audio_manager = app.state::<Arc<AudioRecordingManager>>();
         if audio_manager.is_recording() && is_pressed {
-            action.start(app, binding_id, hotkey_string);
+            action.start(app, binding_id, hotkey_string, triggered_at);
         }
         return;
     }
 
     // Remaining bindings (e.g. "test") use simple start/stop on press/release.
     if is_pressed {
-        action.start(app, binding_id, hotkey_string);
+        action.start(app, binding_id, hotkey_string, triggered_at);
     } else {
-        action.stop(app, binding_id, hotkey_string);
+        action.stop(app, binding_id, hotkey_string, triggered_at);
     }
 }

@@ -189,16 +189,18 @@ enum Effect {
     Start {
         binding_id: String,
         hotkey_string: String,
+        triggered_at: Instant,
     },
     Stop {
         binding_id: String,
         hotkey_string: String,
+        triggered_at: Instant,
     },
 }
 
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
-    Input(InputEvent),
+    Input(InputEvent, Instant),
     Cancel { recording_was_active: bool },
     ProcessingFinished,
 }
@@ -393,7 +395,11 @@ impl CoordinatorState {
                     // hold mode (the setting changed mid-recording) — otherwise
                     // nothing but Escape could stop it.
                     if self.is_locked() || input.mode == ShortcutActivation::Toggle {
-                        return Some(self.begin_processing(input.binding_id, input.hotkey_string));
+                        return Some(self.begin_processing(
+                            input.binding_id,
+                            input.hotkey_string,
+                            now,
+                        ));
                     }
                     // The key is still held (its release will end this
                     // recording), so a repeated press means nothing.
@@ -483,7 +489,7 @@ impl CoordinatorState {
             // stopping is the safe reading (it is what push-to-talk always did).
             .unwrap_or(Duration::MAX);
         if held >= threshold {
-            return Some(self.begin_processing(binding_id, hotkey_string));
+            return Some(self.begin_processing(binding_id, hotkey_string, released_at));
         }
         if let Some(hold) = &mut self.hold {
             debug!("Tap ({held:?}) for '{binding_id}': recording locked on until the next press");
@@ -546,15 +552,22 @@ impl CoordinatorState {
         Effect::Start {
             binding_id,
             hotkey_string,
+            triggered_at: pressed_at,
         }
     }
 
-    fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
+    fn begin_processing(
+        &mut self,
+        binding_id: String,
+        hotkey_string: String,
+        triggered_at: Instant,
+    ) -> Effect {
         self.stage = Stage::Processing;
         self.hold = None;
         Effect::Stop {
             binding_id,
             hotkey_string,
+            triggered_at,
         }
     }
 }
@@ -605,8 +618,8 @@ impl TranscriptionCoordinator {
 
                     let was_locked = state.is_recording_locked();
                     match cmd {
-                        Command::Input(input) => {
-                            if let Some(effect) = state.on_input(input, Instant::now()) {
+                        Command::Input(input, triggered_at) => {
+                            if let Some(effect) = state.on_input(input, triggered_at) {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
@@ -650,14 +663,18 @@ impl TranscriptionCoordinator {
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
+        triggered_at: Instant,
     ) {
         self.send(
-            binding_id,
-            hotkey_string,
-            is_pressed,
-            mode,
-            hold_threshold,
-            false,
+            InputEvent {
+                binding_id: binding_id.to_string(),
+                hotkey_string: hotkey_string.to_string(),
+                is_pressed,
+                mode,
+                hold_threshold,
+                external: false,
+            },
+            triggered_at,
         );
     }
 
@@ -665,36 +682,20 @@ impl TranscriptionCoordinator {
     /// always exempt from debounce — see [`InputEvent::external`].
     pub fn send_external_input(&self, binding_id: &str, source: &str) {
         self.send(
-            binding_id,
-            source,
-            true,
-            ShortcutActivation::Toggle,
-            Duration::ZERO,
-            true,
+            InputEvent {
+                binding_id: binding_id.to_string(),
+                hotkey_string: source.to_string(),
+                is_pressed: true,
+                mode: ShortcutActivation::Toggle,
+                hold_threshold: Duration::ZERO,
+                external: true,
+            },
+            Instant::now(),
         );
     }
 
-    fn send(
-        &self,
-        binding_id: &str,
-        hotkey_string: &str,
-        is_pressed: bool,
-        mode: ShortcutActivation,
-        hold_threshold: Duration,
-        external: bool,
-    ) {
-        if self
-            .tx
-            .send(Command::Input(InputEvent {
-                binding_id: binding_id.to_string(),
-                hotkey_string: hotkey_string.to_string(),
-                is_pressed,
-                mode,
-                hold_threshold,
-                external,
-            }))
-            .is_err()
-        {
+    fn send(&self, input: InputEvent, triggered_at: Instant) {
+        if self.tx.send(Command::Input(input, triggered_at)).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -723,8 +724,9 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
         Effect::Start {
             binding_id,
             hotkey_string,
+            triggered_at,
         } => {
-            let started = start(app, &binding_id, &hotkey_string);
+            let started = start(app, &binding_id, &hotkey_string, triggered_at);
             state.on_start_result(&binding_id, started);
             if started {
                 emit_recording_phase(app, RecordingPhase::Started);
@@ -733,8 +735,9 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
         Effect::Stop {
             binding_id,
             hotkey_string,
+            triggered_at,
         } => {
-            stop(app, &binding_id, &hotkey_string);
+            stop(app, &binding_id, &hotkey_string, triggered_at);
             emit_recording_phase(app, RecordingPhase::Stopped);
         }
     }
@@ -742,12 +745,12 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
 
 /// Execute a start effect; returns whether recording actually began, so the
 /// state machine can roll back its optimistic transition on failure.
-fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
+fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str, triggered_at: Instant) -> bool {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return false;
     };
-    action.start(app, binding_id, hotkey_string);
+    action.start(app, binding_id, hotkey_string, triggered_at);
     let recording = app
         .try_state::<Arc<AudioRecordingManager>>()
         .is_some_and(|a| a.is_recording());
@@ -757,17 +760,47 @@ fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
     recording
 }
 
-fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
+fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str, triggered_at: Instant) {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.stop(app, binding_id, hotkey_string);
+    action.stop(app, binding_id, hotkey_string, triggered_at);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_latency_origin_precedes_release_grace() {
+        let mut state = CoordinatorState::new();
+        let pressed_at = Instant::now();
+        let released_at = pressed_at + Duration::from_millis(100);
+        assert!(matches!(
+            state.on_input(ptt_input(true), pressed_at),
+            Some(Effect::Start { triggered_at, .. }) if triggered_at == pressed_at
+        ));
+        assert!(state.on_input(ptt_input(false), released_at).is_none());
+        assert!(matches!(
+            state.on_grace_expired(),
+            Some(Effect::Stop { triggered_at, .. }) if triggered_at == released_at
+        ));
+    }
+
+    #[test]
+    fn queued_press_retains_its_original_latency_origin() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(toggle_input(true), now);
+        state.on_input(toggle_input(true), now + Duration::from_millis(100));
+        let queued_at = now + Duration::from_millis(200);
+        state.on_input(toggle_input(true), queued_at);
+        assert!(matches!(
+            state.on_processing_finished(),
+            Some(Effect::Start { triggered_at, .. }) if triggered_at == queued_at
+        ));
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {
