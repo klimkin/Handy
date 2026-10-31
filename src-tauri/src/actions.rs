@@ -2,7 +2,7 @@
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::VadPolicy;
-use crate::diagnostics::{self, Args, Code, Name};
+use crate::diagnostics::{self, Args, Code, Name, RunId};
 use crate::managers::audio::{
     code_from_recording_error, recording_error_type, AudioRecordingManager, StoppedRecording,
 };
@@ -91,19 +91,71 @@ struct RecordingErrorEvent {
     detail: Option<String>,
 }
 
+/// How the run span ends when a [`FinishGuard`] drops.
+enum RunEnd {
+    /// No active recording was adopted; there is no run to end.
+    None,
+    /// End the run span with this code on drop. Every task exit updates
+    /// the code; drop is the single place the span closes.
+    End(RunId, Code),
+    /// The paste thread outlives the guard and ends the run itself.
+    DeferredToPasteThread,
+}
+
 /// Drop guard that finishes the transcription pipeline, including immediate
 /// model unloading on early exits.
-struct FinishGuard(AppHandle, Arc<TranscriptionManager>);
+struct FinishGuard {
+    app: AppHandle,
+    tm: Arc<TranscriptionManager>,
+    run_end: RunEnd,
+}
+
+impl FinishGuard {
+    fn new(app: AppHandle, tm: Arc<TranscriptionManager>) -> Self {
+        Self {
+            app,
+            tm,
+            run_end: RunEnd::None,
+        }
+    }
+
+    /// Bind the guard to a recording's run. Cancels are the default: an
+    /// adopted run whose task never reaches a decision was cancelled.
+    fn adopt_run(&mut self, run: RunId) {
+        self.run_end = RunEnd::End(run, Code::Cancelled);
+    }
+
+    fn finish_run(&mut self, code: Code) {
+        if let RunEnd::End(run, _) = self.run_end {
+            self.run_end = RunEnd::End(run, code);
+        }
+    }
+
+    fn defer_run_to_paste_thread(&mut self) {
+        self.run_end = RunEnd::DeferredToPasteThread;
+    }
+}
+
 impl Drop for FinishGuard {
     fn drop(&mut self) {
-        self.1.maybe_unload_immediately("transcription session");
-        if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
+        self.tm.maybe_unload_immediately("transcription session");
+        if let Some(c) = self.app.try_state::<TranscriptionCoordinator>() {
             c.notify_processing_finished();
         }
         // The pipeline just freed its large transient buffers (captured PCM,
         // WAV copy, engine scratch); hand the cached pages back to the OS so
         // they don't sit in malloc arenas until they get swapped out (#1792).
         crate::memory::trim_freed_memory();
+        if let RunEnd::End(run, code) = self.run_end {
+            diagnostics::end(
+                run,
+                Name::Run,
+                Args {
+                    code: Some(code),
+                    ..Default::default()
+                },
+            );
+        }
     }
 }
 
@@ -531,7 +583,7 @@ impl ShortcutAction for TranscribeAction {
             long_form: false,
         };
         if live_decode(expected_model, settings.long_form_chunking) != LiveDecode::None {
-            tm.start_stream();
+            tm.start_stream(run);
         }
         let plan_elapsed = plan_started.elapsed();
 
@@ -696,16 +748,43 @@ impl ShortcutAction for TranscribeAction {
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone(), Arc::clone(&tm));
+            let mut guard = FinishGuard::new(ah.clone(), Arc::clone(&tm));
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(stopped) = rm.stop_recording(&binding_id, cancel_generation) {
-                let StoppedRecording { samples, run: _run } = stopped;
-                // `_run` travels with the samples for the T6 decode spans.
+            // The capture-stop span must open before the drain, and the run id
+            // lives in the recording state until the samples come out.
+            let span_run = rm.active_run(&binding_id);
+            if let Some(run) = span_run {
+                diagnostics::begin(run, Name::CaptureStop);
+            }
+            let stopped = rm.stop_recording(&binding_id, cancel_generation);
+            if let Some(run) = span_run {
+                diagnostics::end(
+                    run,
+                    Name::CaptureStop,
+                    match &stopped {
+                        Some(s) => Args {
+                            count: Some(s.dropped_frames),
+                            code: s.recorder_failure,
+                            ..Default::default()
+                        },
+                        None => Args::default(),
+                    },
+                );
+            }
+            if let Some(stopped) = stopped {
+                let StoppedRecording {
+                    samples,
+                    run,
+                    dropped_frames: _,
+                    recorder_failure: _,
+                } = stopped;
+                guard.adopt_run(run);
+                diagnostics::end(run, Name::Recording, Args::default());
                 // Read now: by the time transcribing ends, another take may
                 // have replaced it.
                 let input_silent = rm.last_input_silent();
@@ -717,6 +796,7 @@ impl ShortcutAction for TranscribeAction {
 
                 if rm.was_cancelled_since(cancel_generation) {
                     debug!("Transcription operation cancelled after recording stop");
+                    guard.finish_run(Code::Cancelled);
                     tm.cancel_stream();
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
@@ -725,6 +805,11 @@ impl ShortcutAction for TranscribeAction {
 
                 if samples.is_empty() {
                     debug!("Recording produced no audio samples; skipping persistence");
+                    guard.finish_run(if input_silent {
+                        Code::Silent
+                    } else {
+                        Code::Empty
+                    });
                     // Tear down any streaming worker so its channel doesn't leak
                     // and block the next start_stream.
                     tm.cancel_stream();
@@ -747,7 +832,7 @@ impl ShortcutAction for TranscribeAction {
                     // otherwise a batch run of the samples. A cancel is surfaced
                     // as an error, so it never starts a batch run.
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe_recording(samples);
+                    let transcription_result = tm.transcribe_recording(samples, run);
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
@@ -798,13 +883,26 @@ impl ShortcutAction for TranscribeAction {
                                     show_processing_overlay(&ah);
                                 }
                             }
-                            let Some(processed) = complete_unless_cancelled(
+                            diagnostics::begin(run, Name::PostProcess);
+                            let processed = complete_unless_cancelled(
                                 process_transcription_output(&ah, &transcription, post_process),
                                 || rm.was_cancelled_since(cancel_generation),
                             )
-                            .await
-                            else {
+                            .await;
+                            // End the span before branching: a cancel during
+                            // post-processing closes it with `cancelled`, not
+                            // as an incomplete span at capture stop.
+                            diagnostics::end(
+                                run,
+                                Name::PostProcess,
+                                Args {
+                                    code: processed.is_none().then_some(Code::Cancelled),
+                                    ..Default::default()
+                                },
+                            );
+                            let Some(processed) = processed else {
                                 debug!("Transcription operation cancelled during output handling");
+                                guard.finish_run(Code::Cancelled);
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
@@ -812,6 +910,7 @@ impl ShortcutAction for TranscribeAction {
 
                             if rm.was_cancelled_since(cancel_generation) {
                                 debug!("Transcription operation cancelled before paste");
+                                guard.finish_run(Code::Cancelled);
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
@@ -819,6 +918,7 @@ impl ShortcutAction for TranscribeAction {
 
                             // Save to history if WAV was saved
                             if wav_saved {
+                                diagnostics::begin(run, Name::HistorySave);
                                 if let Err(err) = hm.save_entry(
                                     file_name,
                                     transcription,
@@ -829,9 +929,15 @@ impl ShortcutAction for TranscribeAction {
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
+                                diagnostics::end(run, Name::HistorySave, Args::default());
                             }
 
                             if processed.final_text.is_empty() {
+                                guard.finish_run(if input_silent {
+                                    Code::Silent
+                                } else {
+                                    Code::Empty
+                                });
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 emit_transcription_complete(
@@ -890,9 +996,13 @@ impl ShortcutAction for TranscribeAction {
                                             stop_time,
                                         );
                                     })
-                                    .map(|_| ())
+                                    // The paste thread outlives this guard,
+                                    // so only a successful spawn hands the
+                                    // run's ending over to it (T7).
+                                    .map(|_| guard.defer_run_to_paste_thread())
                                     .unwrap_or_else(|e| {
                                         error!("Failed to start the paste thread: {:?}", e);
+                                        guard.finish_run(Code::Failed);
                                         utils::hide_recording_overlay(&ah);
                                         set_tray_state(&ah, TrayIconState::Idle);
                                         emit_transcription_complete(
@@ -909,17 +1019,20 @@ impl ShortcutAction for TranscribeAction {
                                 debug!(
                                     "Transcription operation cancelled after transcription error"
                                 );
+                                guard.finish_run(Code::Cancelled);
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                                 return;
                             }
 
+                            guard.finish_run(Code::Failed);
                             error!("Transcription failed: {}", err);
                             // Surface the failure to the UI (toast). The full
                             // message is also in handy.log via the line above.
                             let _ = ah.emit("transcription-error", err.to_string());
                             // Save entry with empty text so user can retry
                             if wav_saved {
+                                diagnostics::begin(run, Name::HistorySave);
                                 if let Err(save_err) = hm.save_entry(
                                     file_name,
                                     String::new(),
@@ -930,6 +1043,7 @@ impl ShortcutAction for TranscribeAction {
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
+                                diagnostics::end(run, Name::HistorySave, Args::default());
                             }
                             utils::hide_recording_overlay(&ah);
                             set_tray_state(&ah, TrayIconState::Idle);

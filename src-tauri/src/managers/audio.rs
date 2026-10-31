@@ -315,6 +315,18 @@ impl OpenMicrophone {
 pub struct StoppedRecording {
     pub samples: Vec<f32>,
     pub run: RunId,
+    /// Microphone frames the recorder dropped during the take.
+    pub dropped_frames: u64,
+    /// Why the recorder ended the take early, if it failed. Fixed
+    /// vocabulary; the error text stays in the log.
+    pub recorder_failure: Option<Code>,
+}
+
+/// What stopping the recorder produced, before the VAD detector is reused.
+struct CollectedAudio {
+    samples: Vec<f32>,
+    dropped_frames: u64,
+    failure: Option<Code>,
 }
 
 /// The `recording-error` event's `error_type` for a recording that couldn't
@@ -955,19 +967,21 @@ impl AudioRecordingManager {
 
     /// Stops the recording on `microphone`, returning its audio and taking
     /// back the detector it borrowed.
-    fn collect_recording(&self, microphone: &OpenMicrophone) -> Vec<f32> {
+    fn collect_recording(&self, microphone: &OpenMicrophone) -> CollectedAudio {
         match microphone.recorder.stop() {
             Ok(stopped) => {
-                match &stopped.end_reason {
-                    EndReason::StopCalled => {}
+                let failure = match &stopped.end_reason {
+                    EndReason::StopCalled => None,
                     EndReason::RecorderFailed(error) => {
                         microphone.failed.store(true, Ordering::Release);
                         warn!("Recording cut short by a microphone failure; keeping the audio before it: {error}");
+                        Some(Code::RecorderFailed)
                     }
                     EndReason::SinkPanicked(message) => {
                         error!("Recording cut short; audio processing panicked: {message}");
+                        Some(Code::SinkPanicked)
                     }
-                }
+                };
                 if stopped.dropped_frames > 0 {
                     warn!(
                         "Recording completed after dropping {} microphone frames",
@@ -978,7 +992,11 @@ impl AudioRecordingManager {
                 self.return_vad(captured.vad);
                 self.last_input_silent
                     .store(captured.input_silent, Ordering::Release);
-                captured.samples
+                CollectedAudio {
+                    samples: captured.samples,
+                    dropped_frames: stopped.dropped_frames,
+                    failure,
+                }
             }
             Err(e) => {
                 // The recording and its detector are lost with the sink.
@@ -988,7 +1006,11 @@ impl AudioRecordingManager {
                     microphone.failed.store(true, Ordering::Release);
                 }
                 *self.vad.lock().unwrap() = VadSlot::Unloaded;
-                Vec::new()
+                CollectedAudio {
+                    samples: Vec::new(),
+                    dropped_frames: 0,
+                    failure: None,
+                }
             }
         }
     }
@@ -1237,6 +1259,19 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
+    /// The diagnostics run of the recording active for `binding_id`, if any.
+    /// Lets a caller open a span around the whole stop drain, before the run
+    /// leaves the state with the samples.
+    pub fn active_run(&self, binding_id: &str) -> Option<RunId> {
+        match &*self.state.lock().unwrap() {
+            RecordingState::Recording {
+                binding_id: active,
+                run,
+            } if active == binding_id => Some(*run),
+            _ => None,
+        }
+    }
+
     pub fn stop_recording(
         &self,
         binding_id: &str,
@@ -1275,12 +1310,16 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let samples = match self.recorder.lock().unwrap().as_ref() {
+                let collected = match self.recorder.lock().unwrap().as_ref() {
                     Some(microphone) => self.collect_recording(microphone),
                     None => {
                         error!("Recorder not available");
                         self.last_input_silent.store(false, Ordering::Release);
-                        Vec::new()
+                        CollectedAudio {
+                            samples: Vec::new(),
+                            dropped_frames: 0,
+                            failure: None,
+                        }
                     }
                 };
 
@@ -1298,21 +1337,36 @@ impl AudioRecordingManager {
 
                 if self.was_cancelled_since(cancel_generation) {
                     debug!("Recording stop cancelled; discarding captured samples");
-                    return None;
+                    // The run travels back even with no samples: a cancel that
+                    // arrived mid-stop must still end its spans (cancelled),
+                    // which the caller can only do with the id.
+                    return Some(StoppedRecording {
+                        samples: Vec::new(),
+                        run,
+                        dropped_frames: collected.dropped_frames,
+                        recorder_failure: collected.failure,
+                    });
                 }
 
                 // Pad if very short
-                let s_len = samples.len();
+                let s_len = collected.samples.len();
                 // debug!("Got {} samples", s_len);
                 if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
-                    let mut padded = samples;
+                    let mut padded = collected.samples;
                     padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
                     Some(StoppedRecording {
                         samples: padded,
                         run,
+                        dropped_frames: collected.dropped_frames,
+                        recorder_failure: collected.failure,
                     })
                 } else {
-                    Some(StoppedRecording { samples, run })
+                    Some(StoppedRecording {
+                        samples: collected.samples,
+                        run,
+                        dropped_frames: collected.dropped_frames,
+                        recorder_failure: collected.failure,
+                    })
                 }
             }
             _ => None,
