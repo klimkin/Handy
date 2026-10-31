@@ -2,7 +2,10 @@
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::VadPolicy;
-use crate::managers::audio::{recording_error_type, AudioRecordingManager};
+use crate::diagnostics::{self, Args, Code, Name};
+use crate::managers::audio::{
+    code_from_recording_error, recording_error_type, AudioRecordingManager, StoppedRecording,
+};
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTraits};
@@ -470,12 +473,29 @@ impl ShortcutAction for TranscribeAction {
                 .get_model_path(&selected_model)
             {
                 warn!("Not starting recording: no model can transcribe it ({})", e);
+                // A degenerate run: both spans open and immediately close, so
+                // the trace shows the rejected take with its reason code.
+                let run = diagnostics::next_run();
+                diagnostics::begin(run, Name::Run);
+                diagnostics::begin(run, Name::Recording);
+                diagnostics::end(run, Name::Recording, Args::default());
+                diagnostics::end(
+                    run,
+                    Name::Run,
+                    Args {
+                        code: Some(Code::NoModel),
+                        ..Default::default()
+                    },
+                );
                 return;
             }
         }
 
         let binding_id = binding_id.to_string();
         RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
+        let run = diagnostics::next_run();
+        diagnostics::begin(run, Name::Run);
+        diagnostics::begin(run, Name::Recording);
         let tray_started = Instant::now();
         set_tray_state(app, TrayIconState::Recording);
         let tray_elapsed = tray_started.elapsed();
@@ -537,7 +557,7 @@ impl ShortcutAction for TranscribeAction {
 
         let mut recording_error: Option<anyhow::Error> = None;
         let recording_start_time = Instant::now();
-        match rm.try_start_recording(&binding_id, vad_policy) {
+        match rm.try_start_recording(&binding_id, vad_policy, run) {
             Ok(readiness) => {
                 debug!(
                     "Recording request accepted in {:?}; waiting for first microphone samples",
@@ -551,6 +571,9 @@ impl ShortcutAction for TranscribeAction {
                         debug!("Microphone readiness wait ended without receiving samples");
                         return;
                     }
+                    // Scheduling lag of this thread relative to first audio
+                    // delivery on the recorder thread, for the same run.
+                    diagnostics::instant(Some(run), Name::ReadyObserved, Args::default());
 
                     // Development-only preview hook for evaluating the brief
                     // arming animation on hardware that normally starts too fast
@@ -589,6 +612,17 @@ impl ShortcutAction for TranscribeAction {
             }
             Err(e) => {
                 debug!("Failed to start recording: {}", e);
+                // The take never started; close the spans here with the
+                // failure code instead of leaving them incomplete.
+                diagnostics::end(run, Name::Recording, Args::default());
+                diagnostics::end(
+                    run,
+                    Name::Run,
+                    Args {
+                        code: Some(code_from_recording_error(&e)),
+                        ..Default::default()
+                    },
+                );
                 recording_error = Some(e);
             }
         }
@@ -669,7 +703,9 @@ impl ShortcutAction for TranscribeAction {
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) {
+            if let Some(stopped) = rm.stop_recording(&binding_id, cancel_generation) {
+                let StoppedRecording { samples, run: _run } = stopped;
+                // `_run` travels with the samples for the T6 decode spans.
                 // Read now: by the time transcribing ends, another take may
                 // have replaced it.
                 let input_silent = rm.last_input_silent();

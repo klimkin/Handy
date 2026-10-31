@@ -6,6 +6,7 @@ use crate::audio_toolkit::{
     },
     CaptureSink, CaptureVad, SileroVad, SpeechScorer, VadPolicy, VoiceActivityDetector,
 };
+use crate::diagnostics::{self, Args, Code, Name, RunId};
 use crate::helpers::clamshell;
 use crate::managers::transcription::StreamRouter;
 use crate::settings::{get_settings, write_settings, AppSettings, VadBackend};
@@ -238,7 +239,12 @@ const WHISPER_SAMPLE_RATE: usize = 16000;
 #[derive(Clone, Debug)]
 pub enum RecordingState {
     Idle,
-    Recording { binding_id: String },
+    Recording {
+        binding_id: String,
+        /// The diagnostics run this take belongs to. Travels with the
+        /// recording so `stop_recording` can stamp spans without a global.
+        run: RunId,
+    },
     Stopping,
 }
 
@@ -304,6 +310,13 @@ impl OpenMicrophone {
     }
 }
 
+/// What a finished recording hands back: the samples that passed the VAD
+/// policy, and the diagnostics run they belong to.
+pub struct StoppedRecording {
+    pub samples: Vec<f32>,
+    pub run: RunId,
+}
+
 /// The `recording-error` event's `error_type` for a recording that couldn't
 /// start.
 pub fn recording_error_type(error: &anyhow::Error) -> &'static str {
@@ -316,6 +329,16 @@ pub fn recording_error_type(error: &anyhow::Error) -> &'static str {
         // means there is no input device at all.
         Some(ErrorKind::DeviceUnavailable) => "no_input_device",
         _ => "unknown",
+    }
+}
+
+/// Trace code for a failed start, from the same classification the UI event
+/// uses. Fixed vocabulary: no error text reaches the trace.
+pub(crate) fn code_from_recording_error(error: &anyhow::Error) -> Code {
+    match recording_error_type(error) {
+        "microphone_permission_denied" => Code::MicrophonePermissionDenied,
+        "no_input_device" => Code::NoInputDevice,
+        _ => Code::Unknown,
     }
 }
 
@@ -1014,6 +1037,26 @@ impl AudioRecordingManager {
         &self,
         binding_id: &str,
         vad_policy: VadPolicy,
+        run: RunId,
+    ) -> Result<RecordingReadiness, anyhow::Error> {
+        diagnostics::begin(run, Name::MicOpen);
+        let result = self.try_start_recording_inner(binding_id, vad_policy, run);
+        diagnostics::end(
+            run,
+            Name::MicOpen,
+            Args {
+                code: result.as_ref().err().map(code_from_recording_error),
+                ..Default::default()
+            },
+        );
+        result
+    }
+
+    fn try_start_recording_inner(
+        &self,
+        binding_id: &str,
+        vad_policy: VadPolicy,
+        run: RunId,
     ) -> Result<RecordingReadiness, anyhow::Error> {
         let mut state = self.state.lock().unwrap();
         if !matches!(*state, RecordingState::Idle) {
@@ -1044,6 +1087,7 @@ impl AudioRecordingManager {
                 Arc::clone(&self.on_levels),
                 Arc::clone(&self.on_audio),
                 ready_tx,
+                run,
             );
 
             let recorder = self.recorder.lock().unwrap();
@@ -1059,6 +1103,7 @@ impl AudioRecordingManager {
                         &mut state,
                         RecordingState::Recording {
                             binding_id: binding_id.to_string(),
+                            run,
                         },
                     );
                     debug!("Recording requested for binding {binding_id}");
@@ -1192,13 +1237,18 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
-    pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
+    pub fn stop_recording(
+        &self,
+        binding_id: &str,
+        cancel_generation: u64,
+    ) -> Option<StoppedRecording> {
         self.invalidate_recording_readiness();
         let mut state = self.state.lock().unwrap();
 
         match *state {
             RecordingState::Recording {
                 binding_id: ref active,
+                run,
             } if active == binding_id => {
                 self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
@@ -1257,9 +1307,12 @@ impl AudioRecordingManager {
                 if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
                     let mut padded = samples;
                     padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                    Some(padded)
+                    Some(StoppedRecording {
+                        samples: padded,
+                        run,
+                    })
                 } else {
-                    Some(samples)
+                    Some(StoppedRecording { samples, run })
                 }
             }
             _ => None,
@@ -1281,7 +1334,7 @@ impl AudioRecordingManager {
         let mut state = self.state.lock().unwrap();
 
         match *state {
-            RecordingState::Recording { .. } => {
+            RecordingState::Recording { run, .. } => {
                 self.set_state(&mut state, RecordingState::Idle);
                 drop(state);
 
@@ -1299,6 +1352,11 @@ impl AudioRecordingManager {
                         self.stop_microphone_stream();
                     }
                 }
+
+                // The take is discarded, so its spans end here with a cancel
+                // code rather than waiting incomplete at capture stop.
+                diagnostics::end(run, Name::Recording, Args::default());
+                diagnostics::end(run, Name::Run, Args::code(Code::Cancelled));
             }
             RecordingState::Stopping => {
                 debug!("Cancellation requested while recording is stopping");
