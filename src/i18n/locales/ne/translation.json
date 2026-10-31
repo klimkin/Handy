@@ -713,6 +713,18 @@
       "dropDescription": "यो इतिहासमा देखिनेछ।"
     },
     "debug": {
+      "diagnostics": {
+        "title": "Diagnostics capture",
+        "description": "Record timing diagnostics for a support session.",
+        "start": "Start diagnostics",
+        "stopAndSave": "Stop and save",
+        "active": "Recording diagnostics",
+        "counts": "{{events}} events, {{dropped}} dropped",
+        "savedTo": "Saved to {{path}}",
+        "reveal": "Reveal",
+        "privacyNote": "Timing data only — no audio or transcribed text is recorded.",
+        "error": "Diagnostics failed: {{message}}"
+      },
       "title": "डिबग",
       "logDirectory": {
         "title": "लग डाइरेक्टरी",
