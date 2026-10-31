@@ -147,14 +147,7 @@ impl Drop for FinishGuard {
         // they don't sit in malloc arenas until they get swapped out (#1792).
         crate::memory::trim_freed_memory();
         if let RunEnd::End(run, code) = self.run_end {
-            diagnostics::end(
-                run,
-                Name::Run,
-                Args {
-                    code: Some(code),
-                    ..Default::default()
-                },
-            );
+            diagnostics::end(run, Name::Run, Args::code(code));
         }
     }
 }
@@ -531,14 +524,7 @@ impl ShortcutAction for TranscribeAction {
                 diagnostics::begin(run, Name::Run);
                 diagnostics::begin(run, Name::Recording);
                 diagnostics::end(run, Name::Recording, Args::default());
-                diagnostics::end(
-                    run,
-                    Name::Run,
-                    Args {
-                        code: Some(Code::NoModel),
-                        ..Default::default()
-                    },
-                );
+                diagnostics::end(run, Name::Run, Args::code(Code::NoModel));
                 return;
             }
         }
@@ -667,14 +653,7 @@ impl ShortcutAction for TranscribeAction {
                 // The take never started; close the spans here with the
                 // failure code instead of leaving them incomplete.
                 diagnostics::end(run, Name::Recording, Args::default());
-                diagnostics::end(
-                    run,
-                    Name::Run,
-                    Args {
-                        code: Some(code_from_recording_error(&e)),
-                        ..Default::default()
-                    },
-                );
+                diagnostics::end(run, Name::Run, Args::code(code_from_recording_error(&e)));
                 recording_error = Some(e);
             }
         }
@@ -963,26 +942,40 @@ impl ShortcutAction for TranscribeAction {
                                             debug!(
                                                 "Transcription operation cancelled before paste"
                                             );
+                                            // The guard handed this run's
+                                            // ending to this thread; a cancel
+                                            // before the paste still closes it.
+                                            diagnostics::end(
+                                                run,
+                                                Name::Run,
+                                                Args::code(Code::Cancelled),
+                                            );
                                             utils::hide_recording_overlay(&ah_clone);
                                             set_tray_state(&ah_clone, TrayIconState::Idle);
                                             return;
                                         }
 
-                                        let outcome =
+                                        diagnostics::begin(run, Name::Output);
+                                        let (outcome, out_code) =
                                             match utils::paste(final_text, ah_clone.clone()) {
                                                 Ok(()) => {
                                                     debug!(
                                                         "Text pasted successfully in {:?}",
                                                         paste_time.elapsed()
                                                     );
-                                                    TranscriptionOutcome::Typed
+                                                    (TranscriptionOutcome::Typed, Code::Typed)
                                                 }
                                                 Err(e) => {
                                                     error!("Failed to paste transcription: {}", e);
                                                     let _ = ah_clone.emit("paste-error", ());
-                                                    TranscriptionOutcome::Failed
+                                                    (
+                                                        TranscriptionOutcome::Failed,
+                                                        Code::PasteFailed,
+                                                    )
                                                 }
                                             };
+                                        diagnostics::end(run, Name::Output, Args::code(out_code));
+                                        diagnostics::end(run, Name::Run, Args::code(out_code));
                                         // A new session may have started while
                                         // this paste ran; the UI is now its.
                                         if RECORDING_SESSION.load(Ordering::SeqCst) == session {

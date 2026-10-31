@@ -794,10 +794,6 @@ pub fn instant_at(at: Instant, run: Option<RunId>, name: Name, args: Args) {
     RECORDER.instant_at(at, run, name, args);
 }
 
-pub fn is_active() -> bool {
-    RECORDER.is_active()
-}
-
 pub fn start(dir: &Path, config: ConfigSnapshot) -> Result<Status, DiagError> {
     RECORDER.start(dir, config)
 }
