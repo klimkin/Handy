@@ -1,7 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
 import { useSettings } from "../../../hooks/useSettings";
 import {
+  APPLE_INTELLIGENCE_PROVIDER_ID,
   commands,
+  OPENVINO_PROVIDER_ID,
   type PostProcessApiFormat,
   type PostProcessProvider,
 } from "@/bindings";
@@ -14,6 +16,7 @@ type PostProcessProviderState = {
   selectedProvider: PostProcessProvider | undefined;
   isCustomProvider: boolean;
   isAppleProvider: boolean;
+  isOpenVinoProvider: boolean;
   appleIntelligenceUnavailable: boolean;
   baseUrl: string;
   handleBaseUrlChange: (value: string) => void;
@@ -34,8 +37,6 @@ type PostProcessProviderState = {
   handleModelCreate: (value: string) => void;
   handleRefreshModels: () => void;
 };
-
-const APPLE_PROVIDER_ID = "apple_intelligence";
 
 export const usePostProcessProviderState = (): PostProcessProviderState => {
   const {
@@ -64,7 +65,9 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
     );
   }, [providers, selectedProviderId]);
 
-  const isAppleProvider = selectedProvider?.id === APPLE_PROVIDER_ID;
+  const isAppleProvider =
+    selectedProvider?.id === APPLE_INTELLIGENCE_PROVIDER_ID;
+  const isOpenVinoProvider = selectedProvider?.id === OPENVINO_PROVIDER_ID;
   const [appleIntelligenceUnavailable, setAppleIntelligenceUnavailable] =
     useState(false);
 
@@ -89,7 +92,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
       if (providerId === selectedProviderId) return;
 
       // Check Apple Intelligence availability before selecting
-      if (providerId === APPLE_PROVIDER_ID) {
+      if (providerId === APPLE_INTELLIGENCE_PROVIDER_ID) {
         const available = await commands.checkAppleIntelligenceAvailable();
         if (!available) {
           setAppleIntelligenceUnavailable(true);
@@ -105,7 +108,10 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
       // a previous provider/base_url can persist and silently 404 at runtime.
       // Skip when the provider isn't configured yet (no API key / empty base URL)
       // to avoid unnecessary backend errors.
-      if (providerId !== APPLE_PROVIDER_ID) {
+      if (
+        providerId !== APPLE_INTELLIGENCE_PROVIDER_ID &&
+        providerId !== OPENVINO_PROVIDER_ID
+      ) {
         const provider = providers.find((p) => p.id === providerId);
         const apiKey = settings?.post_process_api_keys?.[providerId] ?? "";
         const hasBaseUrl = (provider?.base_url ?? "").trim() !== "";
@@ -236,6 +242,7 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
     selectedProvider,
     isCustomProvider,
     isAppleProvider,
+    isOpenVinoProvider,
     appleIntelligenceUnavailable,
     baseUrl,
     handleBaseUrlChange,

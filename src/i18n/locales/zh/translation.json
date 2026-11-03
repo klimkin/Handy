@@ -648,6 +648,36 @@
         "appleIntelligence": {
           "unavailable": "Apple Intelligence 在此设备上不可用。需要运行 macOS Tahoe（26.0）或更高版本的 Apple Silicon Mac，并在系统设置中启用 Apple Intelligence。"
         },
+        "openVino": {
+          "device": {
+            "title": "Device",
+            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "options": {
+              "npu": "NPU",
+              "gpu": "GPU",
+              "cpu": "CPU"
+            }
+          },
+          "model": {
+            "title": "Model",
+            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+          },
+          "checking": "Loading the model...",
+          "ready": "Ready",
+          "download": "Download",
+          "downloading": "Downloading {{percentage}}%",
+          "cancel": "Cancel",
+          "retry": "Try Again",
+          "errors": {
+            "unknownModel": "This model is not offered.",
+            "modelNotDownloaded": "The model is not downloaded yet.",
+            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
+            "deviceFailed": "The model could not load on this device. Try another device.",
+            "generateFailed": "The model failed while cleaning a transcript.",
+            "emptyOutput": "The model returned no text.",
+            "promptTooLong": "The transcript is too long for the NPU."
+          }
+        },
         "baseUrl": {
           "title": "基础 URL",
           "description": "所选提供商的 API 基础 URL。仅自定义提供商可编辑。",

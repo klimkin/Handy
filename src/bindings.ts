@@ -1051,6 +1051,30 @@ async dismissNotice(source: NoticeSource, code: NoticeCode) : Promise<void> {
  */
 async dismissOverlayNotice() : Promise<void> {
     await TAURI_INVOKE("dismiss_overlay_notice");
+},
+async prepareOpenvinoCleaner() : Promise<Result<null, CleanerError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prepare_openvino_cleaner") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async downloadOpenvinoModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_openvino_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeOpenvinoDeviceSetting(device: OpenVinoDevice) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_openvino_device_setting", { device }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -1077,7 +1101,8 @@ transcriptionJob: "transcription-job"
 
 /** user-defined constants **/
 
-
+export const OPENVINO_PROVIDER_ID = "openvino" as const;
+export const APPLE_INTELLIGENCE_PROVIDER_ID = "apple_intelligence" as const;
 
 /** user-defined types **/
 
@@ -1126,7 +1151,7 @@ selected_channel?: number | null; clamshell_microphone?: string | null; selected
  * Every language the person dictates in (codes, e.g. ["en", "zh"]),
  * picked during onboarding. Empty until then.
  */
-spoken_languages?: string[]; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; 
+spoken_languages?: string[]; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; post_process_openvino_device?: OpenVinoDevice; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; 
 /**
  * Experimental, macOS only: move a Bluetooth headset (AirPods) to this
  * Mac while recording, so its microphone does not return silence while
@@ -1205,6 +1230,7 @@ export type ChineseScript =
  * Traditional, in Hong Kong's standard forms.
  */
 "traditional_hk"
+export type CleanerError = "unknown_model" | "model_not_downloaded" | "library_missing" | "device_failed" | "generate_failed" | "empty_output" | "prompt_too_long"
 export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
 export type CustomSounds = { start: boolean; stop: boolean }
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
@@ -1362,6 +1388,7 @@ notices: Notice[];
  * `None` when a notice was cleared.
  */
 raised: Notice | null }
+export type OpenVinoDevice = "npu" | "gpu" | "cpu"
 export type OverlayPosition = "top" | "bottom"
 /**
  * Which recording overlay to display. `Minimal` and `Live` share one base
