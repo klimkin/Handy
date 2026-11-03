@@ -46,8 +46,6 @@ impl App {
     }
 }
 
-// External UI/audio operations are observable boundaries, each scheduled
-// independently from production generation loads. Platform calls are not modeled.
 mod utils {
     use super::*;
     pub fn emit_recording_ready(app: &App) {
@@ -92,8 +90,6 @@ struct Cancellation {
 }
 
 impl Cancellation {
-    // Instrument the actual production load. The record only notes a load
-    // that returned cancellation, never cancellation merely arriving later.
     fn load(&self, ordering: Ordering) -> u64 {
         let value = self.value.load(ordering);
         if value != 0 {
@@ -111,8 +107,6 @@ struct AudioRecordingManager {
     mute_state: Mutex<MuteState>,
 }
 
-// Logging/diagnostics, tray updates and ownership checks have no influence on
-// the covered precommit branch. Keep extracted calls, with explicit no-op stubs.
 mod diagnostics {
     use super::{Args, Name};
     pub fn end(_: (), _: Name, _: Args) {}
@@ -160,7 +154,6 @@ fn emit_recording_phase(_: &App, phase: RecordingPhase) {
         "failed start emitted started phase"
     );
 }
-// Executor boundary reports microphone denial for rollback checks.
 fn start(_: &App, _: &str, _: &str) -> bool {
     false
 }
@@ -215,8 +208,6 @@ fn readiness(target: Cue, concurrent: bool) {
         if concurrent {
             let end = loom::thread::spawn(move || {
                 audio.invalidate_recording_readiness();
-                // User ended old capture; a newer session has acquired UI and
-                // has an open microphone. Native close/open internals omitted.
                 app.effects.lock().unwrap().newer_session = true;
             });
             end.join().unwrap();
@@ -326,8 +317,6 @@ fn busy(now: Instant) -> CoordinatorState {
 fn busy_toggle_parity_exhaustive() {
     let start = Instant::now();
     let mut words = 0;
-    // Every press/release word of lengths 0..8, external or keyboard. Keyboard
-    // edges are 31ms apart, above production's 30ms debounce threshold.
     for external in [false, true] {
         for length in 0..=8 {
             for bits in 0..(1 << length) {
@@ -389,8 +378,6 @@ fn busy_other_binding_preserves_remembered_press() {
 fn busy_cancel_removes_pending_start() {
     let start = Instant::now();
     let mut words = 0;
-    // All two-binding press/release words of lengths 0..6. Cancel occurs at
-    // every possible boundary by checking each prefix before drain.
     for length in 0..=6 {
         for mut word in 0..4_usize.pow(length) {
             let mut state = busy(start);

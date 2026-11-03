@@ -24,7 +24,7 @@ Use the installed stable Rust toolchain and Python 3.10 or newer. Cargo locks Lo
 
 1. Compare covered code against sync commit `af0f7dbe419feb81bd03fa301a70ad20474c827a`.
 2. Inspect every write to `active_stream_worker`. The proof depends on `start_stream` reserving from zero and `StreamWorkerGuard::drop` alone retiring its token. Review any new writer before running the checker.
-3. Run both commands. Current complete run prints six passing tests, one router failure, and seven `CAUGHT` lines. Baseline takes about 23 seconds on the development machine after compilation. Mutation mode runs baseline twice.
+3. Run both commands. Current complete run prints six passing tests, one router failure, and seven `CAUGHT` lines. Mutation mode runs baseline twice.
 4. Inspect `target/stream-ownership/baseline.log` for a failure. Preserve the invariant and report the production function, assertion, and replayed action sequence. Model or extraction drift needs a separate explanation from a product finding.
 5. Update fixtures and bounds when intended code changes invalidate assumptions. Keep production checks, locks, loads, stores, and CAS operations separate. Move the sync commit only after matching each extracted operation and boundary to current source.
 
@@ -36,13 +36,13 @@ Source sync is `af0f7dbe419feb81bd03fa301a70ad20474c827a`. Covered files are unc
 
 `loom/build.rs` parses production Rust with `syn` and emits complete method bodies with `quote`. It fails if a covered method disappears or becomes ambiguous. Methods are never rewritten into a second algorithm.
 
-| Production source | Extracted code | Check |
-| --- | --- | --- |
-| `src-tauri/src/managers/transcription.rs` | `StreamWorkerGuard` and its `Drop` impl; `StreamRouter`, `Route`, `StreamCmd`; `StreamRouter::{new,open,take,clear,feed,is_open}`; `TranscriptionManager::start_stream` | Old cleanup races one real new-start attempt. Successful replacement keeps token 2 and `stream_active=true`. |
-| `src-tauri/src/engine_supervisor/supervisor.rs` | `StreamHandle` fields and `StreamHandle::{feed,finalize}`; `Shared::{epoch,cancelled_since}`; `Owner::{feed,finalize,end_stream}` | Handle preserves frame ID and epoch. Owner rejects frames for absent, replaced, closed, cancelled, or workerless streams. Cancelled finalize reports cancellation even when stream is absent or replaced. |
-| `src-tauri/src/managers/transcription.rs` | `TranscriptionManager::finalize_route` | Worker cancellation reply stays an error through manager handshake. |
-| `src-tauri/src/audio_toolkit/audio/sink.rs` | `CaptureSink::emit` | Old recording's frame must not reach replacement route after stalled callback resumes. Current source fails. |
-| `src-tauri/src/managers/audio.rs`, `src-tauri/src/actions.rs`, cached `handy-recorder-0.1.0/src/capture/engine.rs` | Source correspondence gates over lifecycle methods listed below. No lifecycle method is replaced by an invented implementation. | Callback-overlap witness requires shared router, bounded stop, possible delivery detach, and recorder reopen. |
+| Production source                                                                                                  | Extracted code                                                                                                                                                          | Check                                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src-tauri/src/managers/transcription.rs`                                                                          | `StreamWorkerGuard` and its `Drop` impl; `StreamRouter`, `Route`, `StreamCmd`; `StreamRouter::{new,open,take,clear,feed,is_open}`; `TranscriptionManager::start_stream` | Old cleanup races one real new-start attempt. Successful replacement keeps token 2 and `stream_active=true`.                                                                                              |
+| `src-tauri/src/engine_supervisor/supervisor.rs`                                                                    | `StreamHandle` fields and `StreamHandle::{feed,finalize}`; `Shared::{epoch,cancelled_since}`; `Owner::{feed,finalize,end_stream}`                                       | Handle preserves frame ID and epoch. Owner rejects frames for absent, replaced, closed, cancelled, or workerless streams. Cancelled finalize reports cancellation even when stream is absent or replaced. |
+| `src-tauri/src/managers/transcription.rs`                                                                          | `TranscriptionManager::finalize_route`                                                                                                                                  | Worker cancellation reply stays an error through manager handshake.                                                                                                                                       |
+| `src-tauri/src/audio_toolkit/audio/sink.rs`                                                                        | `CaptureSink::emit`                                                                                                                                                     | Old recording's frame must not reach replacement route after stalled callback resumes. Current source fails.                                                                                              |
+| `src-tauri/src/managers/audio.rs`, `src-tauri/src/actions.rs`, cached `handy-recorder-0.1.0/src/capture/engine.rs` | Source correspondence gates over lifecycle methods listed below. No lifecycle method is replaced by an invented implementation.                                         | Callback-overlap witness requires shared router, bounded stop, possible delivery detach, and recorder reopen.                                                                                             |
 
 ## Bounds and boundaries
 
@@ -64,15 +64,15 @@ Finalize enumerates six already-cancelled states across absent/matching/replaced
 
 Controls modify production source only in temporary directories. Logs and mutated `.rs` files remain under `target/stream-ownership/`. Baseline is rerun against untouched checkout after controls.
 
-| Control | Required assertion failure |
-| --- | --- |
+| Control                    | Required assertion failure                                                                                      |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `retire_token_before_flag` | Old guard releases token, replacement reserves token and activates, old guard clears replacement's active flag. |
-| `remove_feed_id_fence` | Queued ID 1 frame dispatches while current engine stream is ID 2. |
-| `remove_early_cancel` | Cancelled finalize with no stream returns `Ok(None)`. |
-| `swallow_worker_cancel` | `Failure::Cancelled` becomes `Ok(None)` at owner boundary. |
-| `swallow_manager_cancel` | Worker cancellation reply becomes `Ok(None)` in manager. |
-| `swallow_handle_cancel` | Owner cancellation reply becomes `Ok(None)` in handle. |
-| `drop_router_frames` | Removing real router send prevents stale delivery but also drops replacement's fresh frame. |
+| `remove_feed_id_fence`     | Queued ID 1 frame dispatches while current engine stream is ID 2.                                               |
+| `remove_early_cancel`      | Cancelled finalize with no stream returns `Ok(None)`.                                                           |
+| `swallow_worker_cancel`    | `Failure::Cancelled` becomes `Ok(None)` at owner boundary.                                                      |
+| `swallow_manager_cancel`   | Worker cancellation reply becomes `Ok(None)` in manager.                                                        |
+| `swallow_handle_cancel`    | Owner cancellation reply becomes `Ok(None)` in handle.                                                          |
+| `drop_router_frames`       | Removing real router send prevents stale delivery but also drops replacement's fresh frame.                     |
 
 Current finding is a stale frame entering a replacement manager route. Source-linked replay follows:
 

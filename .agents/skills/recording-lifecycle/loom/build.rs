@@ -137,8 +137,6 @@ fn main() {
         .expect("ShortcutActivation missing");
     let variants = &activation.variants;
     output.extend(quote! { #[derive(Clone, Copy, Default, PartialEq, Eq)] enum ShortcutActivation { #variants } });
-    // Adapter changes only the external OS mute call's receiver, allowing its
-    // stub to record the app/session without thread-local Loom-owned values.
     syn::visit_mut::VisitMut::visit_file_mut(&mut MuteAdapter, &mut audio);
     for (name, expected) in [
         ("capture_generation", quote! { Arc<AtomicU64> }),
@@ -192,7 +190,6 @@ fn main() {
     assert_eq!(closures.ready.len(), 1, "ready closure changed");
     assert_eq!(closures.paste.len(), 1, "paste closure changed");
     let ready = &closures.ready[0].stmts;
-    // Entry boundary is after first-sample wait and diagnostics/preview delay.
     let first = ready
         .iter()
         .position(|stmt| {
