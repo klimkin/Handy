@@ -33,7 +33,7 @@ Source sync commit is `af0f7dbe419feb81bd03fa301a70ad20474c827a`.
 Engine, stream, coordinator, readiness, and output source still match that
 baseline. Diagnostics resource accounting changed on the fix branch; its linked
 skill records source correspondence at
-`427bc79b5a94140ff40e0c4d6540f4810132a2ad` and the remaining span finding.
+`f04c6159295ae7c313e8e868336eb6c8d859e705` and the remaining span finding.
 Each linked skill records extracted items, simulated boundaries, finite bounds, and mutation
 controls. A pass covers those conditions, not the whole app.
 

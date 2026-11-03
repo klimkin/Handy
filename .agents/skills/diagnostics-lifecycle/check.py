@@ -67,7 +67,7 @@ def baseline(label: str) -> int:
 def mutations() -> None:
     source = (ROOT / SOURCE).read_text()
     cases = [
-        ("stop_early", "real::writer_drain_inputs", "for ev in self.rx {", "for ev in self.rx.into_iter().take(1) {", "writer lost admitted event"),
+        ("stop_early", "real::writer_drain_inputs", "for ev in &self.rx {", "for ev in self.rx.iter().take(1) {", "writer lost admitted event"),
         ("accept_pre_epoch", "real::stale_timestamp_rejected", "if ev.at < cap.epoch {", "if false {", "pre-epoch event admitted into new capture"),
         ("ignore_total_budget", "real::total_capture_resource_limit", "if next_bytes + next_reserved > self.byte_cap as u128 {", "if false {", "finished capture exceeds resource limits"),
         ("omit_thread_budget", "real::total_capture_resource_limit", "reserved_bytes as u128 + thread_bytes as u128 + new_end_bytes as u128", "reserved_bytes as u128 + new_end_bytes as u128", "finished capture exceeds resource limits"),

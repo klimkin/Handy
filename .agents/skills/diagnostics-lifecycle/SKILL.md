@@ -62,7 +62,7 @@ behavior. That expectation does not satisfy the requested isolation promise.
 
 ## Resource limits
 
-`Writer::run` reserves the complete final output before accepting each event.
+`Writer::write_trace` reserves the complete final output before accepting each event.
 The invariant is `written bytes + reserved bytes <= byte_cap`. Reservations
 cover process/thread metadata, the JSON footer, and synthetic ends for accepted
 open spans. One borrowed footer serializer sizes maximum-width counters and
@@ -92,9 +92,11 @@ production trace or native app stress run is claimed.
 ## Coverage and source correspondence
 
 Last source correspondence checked at
-`427bc79b5a94140ff40e0c4d6540f4810132a2ad`. Compared diagnostics changes from
-`af0f7dbe419feb81bd03fa301a70ad20474c827a`: writer budgeting and serialization
-changed; recorder admission and stop concurrency boundaries stayed intact.
+`f04c6159295ae7c313e8e868336eb6c8d859e705`. The resource fix at
+`427bc79b5a94140ff40e0c4d6540f4810132a2ad` changed budgeting and serialization.
+The later refactor moves fallible writes into `Writer::write_trace`, shares
+record framing, and streams footer fields through a map serializer. Admission
+decisions and recorder stop concurrency boundaries stayed intact.
 Both run commands were rerun with six mutation controls. Old-span isolation
 remains a source bug, not verification drift.
 
@@ -139,7 +141,7 @@ execution; hitting either guard is incomplete verification, not a pass.
 
 Controls mutate scratch copies of the actual source:
 
-- `stop_early` takes only the first queued event in `Writer::run`. The exhaustive
+- `stop_early` takes only the first queued event in `Writer::write_trace`. The exhaustive
   real-writer drain assertion fails with `writer lost admitted event`.
 - `accept_pre_epoch` removes `emit`'s timestamp gate. The admission-isolation
   assertion fails with `pre-epoch event admitted into new capture`. This control
