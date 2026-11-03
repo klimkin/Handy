@@ -69,7 +69,10 @@ def mutations() -> None:
     cases = [
         ("stop_early", "real::writer_drain_inputs", "for ev in self.rx {", "for ev in self.rx.into_iter().take(1) {", "writer lost admitted event"),
         ("accept_pre_epoch", "real::stale_timestamp_rejected", "if ev.at < cap.epoch {", "if false {", "pre-epoch event admitted into new capture"),
-        ("ignore_event_budget", "real::accepted_event_budget", "if bytes + line.len() as u64 + sep_len + 1 > self.byte_cap {", "if false {", "event byte budget bypassed"),
+        ("ignore_total_budget", "real::total_capture_resource_limit", "if next_bytes + next_reserved > self.byte_cap as u128 {", "if false {", "finished capture exceeds resource limits"),
+        ("omit_thread_budget", "real::total_capture_resource_limit", "reserved_bytes as u128 + thread_bytes as u128 + new_end_bytes as u128", "reserved_bytes as u128 + new_end_bytes as u128", "finished capture exceeds resource limits"),
+        ("omit_span_budget", "real::total_capture_resource_limit", "let new_end_bytes = if ev.phase == Phase::Begin && ev.run.is_some() {", "let new_end_bytes = if false {", "finished capture exceeds resource limits"),
+        ("undersize_footer", "real::total_capture_resource_limit", "write_footer(&mut count, config, u64::MAX, u64::MAX, u64::MAX)?;", "write_footer(&mut count, config, 0, 0, 0)?;", "finished capture exceeds resource limits"),
     ]
     for name, test, old, new, message in cases:
         if source.count(old) != 1:

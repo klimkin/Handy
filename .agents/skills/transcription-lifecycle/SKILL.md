@@ -30,8 +30,11 @@ work. When inspecting a failure, read that suite's skill before proposing a fix.
 ## Coverage and source correspondence
 
 Source sync commit is `af0f7dbe419feb81bd03fa301a70ad20474c827a`.
-Product files remain unchanged on this verification branch. Each linked skill
-records extracted items, simulated boundaries, finite bounds, and mutation
+Engine, stream, coordinator, readiness, and output source still match that
+baseline. Diagnostics resource accounting changed on the fix branch; its linked
+skill records source correspondence at
+`427bc79b5a94140ff40e0c4d6540f4810132a2ad` and the remaining span finding.
+Each linked skill records extracted items, simulated boundaries, finite bounds, and mutation
 controls. A pass covers those conditions, not the whole app.
 
 | Priority | Promise                                                                                   | Source                                                               | Suite                                                      |
@@ -62,13 +65,10 @@ Paths in this table are relative to `src-tauri/src/`.
 - Readiness generation validation and UI/chime/mute effects are separate steps.
   A newer recording can begin between them, allowing stale effects.
 - `Span::end` has no capture identity, so old spans can end in a later capture.
-- Writer budgets accepted event lines, while synthetic endings, metadata, and
-  footer can exceed total byte cap. Distinct truncated-event producers still
-  increase retained thread metadata. Tiny-cap witnesses demonstrate the gaps;
-  they are not a default-cap stress test.
 
-These are verification findings, not product fixes. Read each suite's replay
-and assumptions to distinguish source behavior from a harness error.
+Diagnostics resource checks now pass with total-output reservations and no
+metadata insertion for rejected events. The remaining entries are verification
+findings. Read each suite's replay and assumptions to distinguish source behavior from a harness error.
 
 ## Output commitment
 
