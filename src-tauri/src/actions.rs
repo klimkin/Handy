@@ -9,6 +9,7 @@ use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTrait
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::{Transcription, TranscriptionManager};
 use crate::notices::{self, Notice, NoticeCode, NoticeSource};
+use crate::openvino_cleaner::{OpenVinoCleaner, OPENVINO_PROVIDER_ID};
 use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
@@ -193,6 +194,7 @@ enum PostProcessOutcome {
 
 async fn post_process_transcription(
     settings: &AppSettings,
+    openvino: &OpenVinoCleaner,
     transcription: &str,
 ) -> PostProcessOutcome {
     if is_blank_transcription(transcription) {
@@ -254,6 +256,16 @@ async fn post_process_transcription(
         "Starting LLM post-processing with provider '{}' (model: {})",
         provider.id, model
     );
+
+    if provider.id == OPENVINO_PROVIDER_ID {
+        return match openvino.clean(settings, &prompt, transcription).await {
+            Ok(text) => PostProcessOutcome::Done(strip_invisible_chars(strip_think_block(&text))),
+            Err(err) => {
+                error!("OpenVINO post-processing failed: {err}");
+                PostProcessOutcome::Failed
+            }
+        };
+    }
 
     let api_key = settings
         .post_process_api_keys
@@ -441,7 +453,8 @@ pub(crate) async fn process_transcription_output(
 
     if post_process {
         // A reply that's blank once cleaned is no better than none.
-        let outcome = match post_process_transcription(&settings, &final_text).await {
+        let openvino = app.state::<OpenVinoCleaner>();
+        let outcome = match post_process_transcription(&settings, &openvino, &final_text).await {
             PostProcessOutcome::Done(text) => non_blank_post_processed_text(text)
                 .map_or(PostProcessOutcome::Failed, PostProcessOutcome::Done),
             outcome => outcome,
@@ -1074,6 +1087,7 @@ mod tests {
         post_process_transcription, should_use_streaming_overlay, strip_invisible_chars,
         strip_think_block, PostProcessOutcome,
     };
+    use crate::openvino_cleaner::OpenVinoCleaner;
     use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
     use std::future;
     use std::io::{Read, Write};
@@ -1121,7 +1135,13 @@ mod tests {
     }
 
     fn run_post_process(settings: &AppSettings, transcription: &str) -> PostProcessOutcome {
-        tauri::async_runtime::block_on(post_process_transcription(settings, transcription))
+        let cache = std::env::temp_dir().join("handy-openvino-test-cache");
+        let openvino = OpenVinoCleaner::new(cache);
+        tauri::async_runtime::block_on(post_process_transcription(
+            settings,
+            &openvino,
+            transcription,
+        ))
     }
 
     #[test]

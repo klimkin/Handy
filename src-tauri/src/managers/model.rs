@@ -335,6 +335,11 @@ fn hf_cached_path(repo_id: &str, revision: &str, filename: &str) -> Option<PathB
     hf_cached_path_in(&hf_caches(), repo_id, revision, filename)
 }
 
+/// Every cached snapshot directory of `repo_id`, the `revision` pin first.
+pub(crate) fn hf_snapshot_dirs(repo_id: &str, revision: &str) -> Vec<PathBuf> {
+    hf_snapshot_paths(&hf_caches(), repo_id, revision)
+}
+
 /// Reuse an existing file regardless of which revision originally downloaded it.
 /// Prefer the requested pin, then main, then other snapshots.
 fn hf_cached_path_in(
@@ -1913,6 +1918,53 @@ impl ModelManager {
         let _ = self.app_handle.emit("model-download-complete", &model_id);
         info!("HF model {} downloaded", model_id);
         Ok(())
+    }
+
+    /// Fetch every file of a Hugging Face snapshot into the shared HF cache,
+    /// reporting and cancelling under `id`. Never writes into the models dir,
+    /// where a top-level `.bin` would be discovered as a transcription model.
+    /// `Ok(false)` if cancelled.
+    pub async fn download_hf_snapshot(
+        &self,
+        id: &str,
+        label: &str,
+        repo_id: &str,
+        revision: &str,
+        files: &[&str],
+    ) -> Result<bool> {
+        let cancel_token = CancellationToken::new();
+        self.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), cancel_token.clone());
+        let pinned = Cache::from_env().repo(Repo::with_revision(
+            repo_id.to_string(),
+            RepoType::Model,
+            revision.to_string(),
+        ));
+        let mut result = Ok(true);
+        for filename in files {
+            if pinned.get(filename).is_some() {
+                continue;
+            }
+            let transfer = FileTransfer {
+                label,
+                repo_id,
+                revision,
+                filename,
+                mirrors: Vec::new(),
+                progress: ProgressTarget::own(id),
+            };
+            result = self.fetch_hf_file(&transfer, &cancel_token).await;
+            if !matches!(result, Ok(true)) {
+                break;
+            }
+        }
+        self.cancel_flags.lock().unwrap().remove(id);
+        if matches!(result, Ok(true)) {
+            let _ = self.app_handle.emit("model-download-complete", id);
+        }
+        result
     }
 
     /// The language detector, when `model` needs it for Auto and it isn't on

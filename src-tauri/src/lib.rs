@@ -18,6 +18,7 @@ mod llm_client;
 mod managers;
 mod memory;
 mod notices;
+mod openvino_cleaner;
 mod overlay;
 mod paste_tx;
 pub mod portable;
@@ -221,6 +222,9 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(history_manager.clone());
     app_handle.manage(tray::TrayState::new());
     app_handle.manage(TranscriptionJobManager::new(app_handle));
+    let openvino_cache = portable::resolve_app_data(app_handle, "openvino-cache")
+        .expect("Failed to resolve the OpenVINO cache dir");
+    app_handle.manage(openvino_cleaner::OpenVinoCleaner::new(openvino_cache));
 
     // Note: Shortcuts are NOT initialized here.
     // The frontend is responsible for calling the `initialize_shortcuts` command
@@ -815,7 +819,18 @@ pub fn run(cli_args: CliArgs) {
             notices::get_active_notices,
             notices::dismiss_notice,
             notices::dismiss_overlay_notice,
+            openvino_cleaner::prepare_openvino_cleaner,
+            openvino_cleaner::download_openvino_model,
+            openvino_cleaner::change_openvino_device_setting,
         ])
+        .constant(
+            "APPLE_INTELLIGENCE_PROVIDER_ID",
+            settings::APPLE_INTELLIGENCE_PROVIDER_ID,
+        )
+        .constant(
+            "OPENVINO_PROVIDER_ID",
+            openvino_cleaner::OPENVINO_PROVIDER_ID,
+        )
         .events(collect_events![
             managers::history::HistoryUpdatePayload,
             managers::transcription_jobs::TranscriptionJob,

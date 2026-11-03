@@ -19,6 +19,7 @@ use specta::Type;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::openvino_cleaner::{OpenVinoCleaner, OFFERED_MODELS, OPENVINO_PROVIDER_ID};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
@@ -1239,6 +1240,11 @@ pub fn change_post_process_model_setting(
 pub fn set_post_process_provider(app: AppHandle, provider_id: String) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     validate_provider_exists(&settings, &provider_id)?;
+    if settings.post_process_provider_id == OPENVINO_PROVIDER_ID
+        && provider_id != OPENVINO_PROVIDER_ID
+    {
+        app.state::<OpenVinoCleaner>().unload();
+    }
     settings.post_process_provider_id = provider_id;
     settings::write_settings(&app, settings);
     Ok(())
@@ -1345,6 +1351,13 @@ pub async fn fetch_post_process_models(
         {
             return Err("Apple Intelligence is only available on Apple silicon Macs running macOS 15 or later.".to_string());
         }
+    }
+
+    if provider.id == OPENVINO_PROVIDER_ID {
+        return Ok(OFFERED_MODELS
+            .iter()
+            .map(|model| model.id.to_string())
+            .collect());
     }
 
     // Get API key

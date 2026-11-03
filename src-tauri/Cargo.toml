@@ -92,6 +92,9 @@ tauri-plugin-dialog = "2.6"
 hf-hub = { git = "https://github.com/cjpais/hf-hub", branch = "cancellable-downloads", features = [
   "tokio",
 ] }
+# On-device transcript cleanup on an Intel NPU. Loads the OpenVINO runtime at
+# run time, so a machine without it still builds and starts.
+openvino-genai = { version = "0.11.1", features = ["runtime-linking"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

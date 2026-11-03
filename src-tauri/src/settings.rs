@@ -1,3 +1,4 @@
+use crate::openvino_cleaner::{OpenVinoDevice, OFFERED_MODELS, OPENVINO_PROVIDER_ID};
 use crate::utils;
 use log::{debug, warn};
 use serde::de::{self, Visitor};
@@ -495,6 +496,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub post_process_selected_prompt_id: Option<String>,
     #[serde(default)]
+    pub post_process_openvino_device: OpenVinoDevice,
+    #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
     pub append_trailing_space: bool,
@@ -794,6 +797,16 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         });
     }
 
+    providers.push(PostProcessProvider {
+        id: OPENVINO_PROVIDER_ID.to_string(),
+        label: "OpenVINO".to_string(),
+        base_url: "openvino://local".to_string(),
+        allow_base_url_edit: false,
+        models_endpoint: None,
+        supports_structured_output: true,
+        api_format: PostProcessApiFormat::OpenAi,
+    });
+
     // AWS Bedrock via Mantle (OpenAI-compatible endpoint)
     providers.push(PostProcessProvider {
         id: "bedrock_mantle".to_string(),
@@ -830,6 +843,9 @@ fn default_post_process_api_keys() -> SecretMap {
 fn default_model_for_provider(provider_id: &str) -> String {
     if provider_id == APPLE_INTELLIGENCE_PROVIDER_ID {
         return APPLE_INTELLIGENCE_DEFAULT_MODEL_ID.to_string();
+    }
+    if provider_id == OPENVINO_PROVIDER_ID {
+        return OFFERED_MODELS[0].id.to_string();
     }
     String::new()
 }
@@ -1041,6 +1057,7 @@ pub fn get_default_settings() -> AppSettings {
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
+        post_process_openvino_device: OpenVinoDevice::default(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),
