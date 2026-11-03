@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from formal_verdict import verify
 
 SOURCE = Path("src-tauri/src/engine_supervisor/supervisor.rs")
+MANAGER = Path("src-tauri/src/managers/transcription.rs")
 TARGET = ROOT / "target/engine-lifecycle"
 PROPERTIES = {
     "previous_worker_exits_before_replacement": (
@@ -41,6 +42,16 @@ PROPERTIES = {
     "cancelled_queued_work_never_starts": ("old queued work started after cancel",),
     "persisted_gpu_choice_never_falls_back": (
         "persisted explicit GPU selection silently fell back to CPU",
+    ),
+    "publication::manager_loaded_id_respects_pending_unload": (
+        "late manager completion restored model id during pending unload",
+    ),
+    "publication::manager_loaded_ui_respects_pending_unload": (
+        "late manager completion restored loaded UI during pending unload",
+    ),
+    "publication::manager_unload_clears_published_state": (
+        "manager unload retained published model id",
+        "manager unload omitted unloaded UI event",
     ),
 }
 
@@ -102,16 +113,32 @@ def mutations() -> None:
          "            if self.shared.cancelled_since(epoch) {\n                return Err(EngineError::Cancelled);\n            }",
          "", "old queued work started after cancel"),
     ]
-    source = (ROOT / SOURCE).read_text()
-    for name, test, old, new, expected in cases:
+    unloaded_event = (
+        '                event_type: "unloaded".to_string(),\n'
+        '                model_id: None,\n                model_name: None,\n'
+        '                error: None,\n            },\n        );\n        unloading'
+    )
+    cases = [(SOURCE, *case) for case in cases] + [
+        (MANAGER, "omit_manager_id_clear", "publication::manager_unload_clears_published_state",
+         "        self.language_detector.unload();\n        {\n            let mut current_model = self.current_model_id.lock().unwrap();\n            *current_model = None;\n        }",
+         "        self.language_detector.unload();",
+         "manager unload retained published model id"),
+        (MANAGER, "omit_manager_unloaded_event", "publication::manager_unload_clears_published_state",
+         unloaded_event, unloaded_event.replace('"unloaded"', '"loading_completed"'),
+         "manager unload omitted unloaded UI event"),
+    ]
+    sources = {path: (ROOT / path).read_text() for path in (SOURCE, MANAGER)}
+    for filename, name, test, old, new, expected in cases:
+        source = sources[filename]
         if source.count(old) != 1:
             raise RuntimeError(f"{name}: source mutation site changed")
         changed = source.replace(old, new, 1)
         with tempfile.TemporaryDirectory(prefix=f"handy-{name}-") as directory:
             root = Path(directory)
-            path = root / SOURCE
-            path.parent.mkdir(parents=True)
-            path.write_text(changed)
+            for relative, original in sources.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(changed if relative == filename else original)
             result = run(root, test)
         (TARGET / f"{name}.log").write_text(result.stdout)
         (TARGET / f"{name}.rs").write_text(changed)

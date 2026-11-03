@@ -1,6 +1,8 @@
 #![cfg(test)]
 #![allow(dead_code)]
 
+mod publication;
+
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::{

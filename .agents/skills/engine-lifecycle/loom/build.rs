@@ -1,6 +1,6 @@
 use quote::{format_ident, quote};
 use std::{env, fs, path::PathBuf};
-use syn::{ImplItem, Item, Type};
+use syn::{Expr, ImplItem, Item, Stmt, Type};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=HANDY_FORMAL_SOURCE_ROOT");
@@ -142,4 +142,65 @@ fn main() {
         prettyplease::unparse(&extracted),
     )
     .unwrap();
+    let manager_path = root.join("src-tauri/src/managers/transcription.rs");
+    println!("cargo:rerun-if-changed={}", manager_path.display());
+    let manager = syn::parse_file(&fs::read_to_string(manager_path).unwrap()).unwrap();
+    let unload = manager_method(&manager, "begin_unload");
+    let load = manager_method(&manager, "load_model_with_device");
+    let start = load
+        .block
+        .stmts
+        .iter()
+        .position(|statement| {
+            let Stmt::Expr(Expr::Block(block), _) = statement else {
+                return false;
+            };
+            let compact: String = quote!(#block).to_string().split_whitespace().collect();
+            compact.contains("*current_model=Some(model_id.to_string())")
+        })
+        .expect("manager loaded-id publication moved");
+    let tail = &load.block.stmts[start..];
+    let end = tail
+        .iter()
+        .position(|statement| matches!(statement, Stmt::Expr(Expr::ForLoop(_), _)))
+        .expect("manager post-publication notice loop moved");
+    let publication = &tail[..end];
+    let tokens = quote! {
+        impl TranscriptionManager {
+            #unload
+            fn publish_completed_load(&self, model_id: &str, model_info: &ModelInfo) {
+                #(#publication)*
+            }
+        }
+    };
+    let extracted = syn::parse2(tokens).expect("parse manager publication");
+    fs::write(
+        output.join("publication.rs"),
+        prettyplease::unparse(&extracted),
+    )
+    .unwrap();
+}
+
+fn manager_method<'a>(file: &'a syn::File, name: &str) -> &'a syn::ImplItemFn {
+    let methods: Vec<_> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(item)
+                if item.trait_.is_none()
+                    && matches!(item.self_ty.as_ref(),
+            Type::Path(path) if path.path.is_ident("TranscriptionManager")) =>
+            {
+                Some(item)
+            }
+            _ => None,
+        })
+        .flat_map(|item| &item.items)
+        .filter_map(|item| match item {
+            ImplItem::Fn(method) if method.sig.ident == name => Some(method),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(methods.len(), 1, "manager {name} missing or ambiguous");
+    methods[0]
 }
