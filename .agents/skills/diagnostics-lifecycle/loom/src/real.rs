@@ -123,34 +123,25 @@ struct WriterOutput {
     bytes: u64,
     incomplete: u64,
     written: usize,
-    thread_metadata: usize,
+    trace: serde_json::Value,
 }
 
-fn writer_case(sequence: &[u8], cap: u64) -> WriterOutput {
+fn writer_events(
+    input: &[Event],
+    epoch: Instant,
+    cap: u64,
+    snapshot: ConfigSnapshot,
+    dropped: u64,
+) -> Result<Option<WriterOutput>, String> {
     let dir = tempfile::tempdir().unwrap();
     let partial = dir.path().join("capture.partial");
     let final_path = dir.path().join("capture.json");
     let file = File::create(&partial).unwrap();
-    let (sender, rx) = sync_channel(4);
+    let (sender, rx) = sync_channel(input.len().max(1));
     let (done_tx, done_rx) = mpsc::channel();
-    let epoch = Instant::now();
-    for (index, phase) in sequence.iter().enumerate() {
+    for event in input {
         sender
-            .try_send(Event {
-                at: epoch,
-                phase: match phase {
-                    0 => Phase::Instant,
-                    1 => Phase::Begin,
-                    _ => Phase::End,
-                },
-                name: Name::Output,
-                run: Some(RunId(NonZeroU64::new(index as u64 + 1).unwrap())),
-                thread: ThreadTag {
-                    tid: index as u64 + 1,
-                    name: None,
-                },
-                args: Args::default(),
-            })
+            .try_send(*event)
             .unwrap_or_else(|_| panic!("fixture queue unexpectedly full"));
     }
     drop(sender);
@@ -158,40 +149,142 @@ fn writer_case(sequence: &[u8], cap: u64) -> WriterOutput {
         rx,
         done_tx,
         out: BufWriter::new(file),
-        partial,
-        final_path,
+        partial: partial.clone(),
+        final_path: final_path.clone(),
         epoch,
         byte_cap: cap,
-        dropped: Arc::new(AtomicU64::new(0)),
-        config: config(),
+        dropped: Arc::new(AtomicU64::new(dropped)),
+        config: snapshot.clone(),
     }
     .run();
-    let path = done_rx.recv().unwrap();
-    let trace = parse(&path);
+    let path = match done_rx.recv() {
+        Ok(path) => path,
+        Err(_) => {
+            let recorder = Recorder::new();
+            let capture_dir = dir.path().join("recorder-admission");
+            if recorder.start_inner(&capture_dir, snapshot, 4, cap).is_ok() {
+                let _ = recorder.stop();
+                return Err(format!("writer rejected supported cap={cap}"));
+            }
+            if recorder.status().active
+                || recorder.capture.read().unwrap().is_some()
+                || recorder.done_rx.lock().unwrap().is_some()
+                || capture_dir.exists()
+                || partial.exists()
+                || final_path.exists()
+            {
+                return Err(format!("unsupported cap={cap} left capture state or files"));
+            }
+            return Ok(None);
+        }
+    };
+    let bytes = fs::metadata(&path).unwrap().len();
+    let trace: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap())
+        .map_err(|error| format!("cap={cap} produced invalid JSON: {error}"))?;
     let accepted: Vec<_> = events(&trace)
         .into_iter()
-        .filter(|ev| ev["args"]["incomplete"] != true)
+        .filter(|event| event["args"]["incomplete"] != true)
         .collect();
-    let mut used = b"{\"traceEvents\":[\n".len() as u64;
-    for (index, event) in accepted.iter().enumerate() {
-        used += serde_json::to_vec(event).unwrap().len() as u64 + u64::from(index > 0) + 1;
-    }
-    assert!(
-        accepted.is_empty() || used <= cap,
-        "event byte budget bypassed; cap={cap}, accepted bytes={used}"
-    );
     let written = accepted.len();
-    WriterOutput {
-        bytes: fs::metadata(&path).unwrap().len(),
-        incomplete: trace["otherData"]["incomplete_spans"].as_u64().unwrap(),
-        written,
-        thread_metadata: trace["traceEvents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|event| event["name"] == "thread_name")
-            .count(),
+    let truncated = trace["otherData"]["truncated_events"]
+        .as_u64()
+        .ok_or_else(|| "missing truncation count".to_string())?;
+    if bytes > cap {
+        return Err(format!(
+            "cap={cap}, accepted={written}, finished file={bytes} bytes"
+        ));
     }
+    if written as u64 + truncated != input.len() as u64 {
+        return Err(format!(
+            "cap={cap} lost input accounting: written={written}, truncated={truncated}, input={}",
+            input.len()
+        ));
+    }
+    if trace["otherData"]["dropped_events"].as_u64() != Some(dropped) {
+        return Err(format!("cap={cap} lost dropped counter"));
+    }
+    let expected_threads: std::collections::BTreeSet<_> = accepted
+        .iter()
+        .map(|event| event["tid"].as_u64().unwrap())
+        .collect();
+    let metadata: Vec<_> = trace["traceEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["name"] == "thread_name")
+        .map(|event| event["tid"].as_u64().unwrap())
+        .collect();
+    let actual_threads: std::collections::BTreeSet<_> = metadata.iter().copied().collect();
+    if actual_threads != expected_threads || metadata.len() != actual_threads.len() {
+        return Err(format!(
+            "cap={cap} retained rejected or duplicate thread metadata: expected={}, actual={}",
+            expected_threads.len(),
+            metadata.len()
+        ));
+    }
+    let mut open = BTreeMap::new();
+    for event in accepted {
+        let Some(run) = event["id"].as_u64() else {
+            continue;
+        };
+        let key = (run, event["name"].as_str().unwrap().to_string());
+        match event["ph"].as_str().unwrap() {
+            "b" => {
+                open.insert(key, event["tid"].as_u64().unwrap());
+            }
+            "e" => {
+                open.remove(&key);
+            }
+            _ => {}
+        }
+    }
+    let incomplete = trace["otherData"]["incomplete_spans"].as_u64().unwrap();
+    let closures: Vec<_> = events(&trace)
+        .into_iter()
+        .filter(|event| event["args"]["incomplete"] == true)
+        .collect();
+    if incomplete != open.len() as u64 || closures.len() as u64 != incomplete {
+        return Err(format!("cap={cap} did not close every accepted begin"));
+    }
+    for event in closures {
+        let key = (
+            event["id"].as_u64().unwrap(),
+            event["name"].as_str().unwrap().to_string(),
+        );
+        if event["ph"] != "e" || open.remove(&key) != event["tid"].as_u64() {
+            return Err(format!("cap={cap} emitted incorrect incomplete closure"));
+        }
+    }
+    Ok(Some(WriterOutput {
+        bytes,
+        incomplete,
+        written,
+        trace,
+    }))
+}
+
+fn writer_case(sequence: &[u8], cap: u64) -> Result<Option<WriterOutput>, String> {
+    let epoch = Instant::now();
+    let input: Vec<_> = sequence
+        .iter()
+        .enumerate()
+        .map(|(index, phase)| Event {
+            at: epoch,
+            phase: match phase {
+                0 => Phase::Instant,
+                1 => Phase::Begin,
+                _ => Phase::End,
+            },
+            name: Name::Output,
+            run: Some(RunId(NonZeroU64::new(index as u64 + 1).unwrap())),
+            thread: ThreadTag {
+                tid: index as u64 + 1,
+                name: None,
+            },
+            args: Args::default(),
+        })
+        .collect();
+    writer_events(&input, epoch, cap, config(), 0)
 }
 
 fn sequences() -> Vec<Vec<u8>> {
@@ -213,7 +306,9 @@ fn sequences() -> Vec<Vec<u8>> {
 #[test]
 fn writer_drain_inputs() {
     for sequence in sequences() {
-        let output = writer_case(&sequence, 1_000_000);
+        let output = writer_case(&sequence, 1_000_000)
+            .unwrap_or_else(|error| panic!("writer lost admitted event; {error}"))
+            .expect("ample cap rejected");
         assert_eq!(output.written, sequence.len(), "writer lost admitted event");
     }
     println!("EXHAUSTED writer drain inputs: 40");
@@ -222,46 +317,197 @@ fn writer_drain_inputs() {
 #[test]
 fn accepted_event_budget() {
     let mut cases = 0;
+    let mut failures = Vec::new();
     for cap in [0, 1, 16, 64, 128, 256, 512, 1024] {
         for sequence in sequences() {
-            writer_case(&sequence, cap);
+            if let Err(error) = writer_case(&sequence, cap) {
+                failures.push(error);
+            }
             cases += 1;
         }
     }
     println!("EXHAUSTED accepted-byte inputs: {cases}");
+    assert!(
+        failures.is_empty(),
+        "event byte budget bypassed; {} invalid outputs; first={:?}",
+        failures.len(),
+        failures.first()
+    );
 }
 
 #[test]
 fn total_capture_resource_limit() {
-    let mut failures = 0;
-    let mut examples = Vec::new();
-    let mut retained_threads = Vec::new();
+    let mut cases = 0;
+    let mut failures = Vec::new();
     for cap in [0, 1, 16, 64, 128, 256, 512, 1024] {
         for sequence in sequences() {
-            let output = writer_case(&sequence, cap);
-            let WriterOutput {
-                bytes,
-                incomplete,
-                written,
-                thread_metadata,
-            } = output;
-            if cap == 0 && sequence.iter().all(|phase| *phase == 0) {
-                assert_eq!(written, 0);
-                retained_threads.push((sequence.len(), thread_metadata));
+            if let Err(error) = writer_case(&sequence, cap) {
+                failures.push(error);
             }
-            if bytes > cap {
-                failures += 1;
-                if examples.len() < 3 || (incomplete > 0 && examples.len() == 3) {
-                    examples.push(format!("cap={cap}, phases={sequence:?} -> accepted={written}, synthetic ends={incomplete}, finished file={bytes} bytes"));
-                }
-            }
+            cases += 1;
         }
     }
-    for example in examples {
-        println!("COUNTEREXAMPLE resource: {example}");
+    println!(
+        "EXHAUSTED total-byte inputs: {cases}; violations={}",
+        failures.len()
+    );
+
+    let epoch = Instant::now();
+    let maximal = |phase, offset| Event {
+        at: epoch + Duration::from_secs(123_456),
+        phase,
+        name: Name::FirstAudioDelivered,
+        run: Some(RunId(NonZeroU64::new(u64::MAX - offset).unwrap())),
+        thread: ThreadTag {
+            tid: u64::MAX - offset,
+            name: None,
+        },
+        args: Args {
+            code: Some(Code::MicrophonePermissionDenied),
+            count: Some(u64::MAX),
+            flag: Some(false),
+        },
+    };
+    let mut producer_cases = 0;
+    for count in [1, 2, 64, 512] {
+        let input: Vec<_> = (0..count)
+            .map(|offset| maximal(Phase::Begin, offset))
+            .collect();
+        for cap in [2048, 4096, 8192] {
+            match writer_events(&input, epoch, cap, config(), u64::MAX) {
+                Ok(Some(output)) => {
+                    assert!(output.bytes <= cap);
+                    assert_eq!(output.incomplete as usize, output.written);
+                    if count == 512 {
+                        assert!(
+                            output.written < input.len(),
+                            "fixture did not truncate producers"
+                        );
+                    }
+                }
+                Ok(None) => failures.push(format!(
+                    "adversarial fixture cap={cap} unexpectedly unsupported"
+                )),
+                Err(error) => failures.push(error),
+            }
+            producer_cases += 1;
+        }
     }
-    println!("COUNTEREXAMPLE memory: cap=0, accepted=0, (distinct producer tids, retained thread entries)={retained_threads:?}");
-    println!("EXHAUSTED total-byte inputs: 320; violations={failures}");
-    let thread_growth = retained_threads.iter().any(|(_, retained)| *retained != 0);
-    assert!(failures == 0 && !thread_growth, "finished capture exceeds resource limits; byte violations={failures}, unbudgeted thread growth={thread_growth}");
+    println!("EXHAUSTED maximal-counter distinct-producer inputs: {producer_cases}");
+
+    let mut closure_cases = 0;
+    let mut saw_incomplete = false;
+    let mut saw_complete = false;
+    for cap in (512..=4096).step_by(17) {
+        let begin = maximal(Phase::Begin, 0);
+        let mut end = maximal(Phase::End, 0);
+        end.at += Duration::from_secs(1);
+        for input in [&[begin][..], &[begin, end][..]] {
+            match writer_events(input, epoch, cap, config(), u64::MAX) {
+                Ok(Some(output)) => {
+                    saw_incomplete |= output.incomplete > 0;
+                    saw_complete |= output.written == 2 && output.incomplete == 0;
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(error),
+            }
+            closure_cases += 1;
+        }
+    }
+    println!("EXHAUSTED closure-budget inputs: {closure_cases}");
+    assert!(
+        !failures.is_empty() || (saw_incomplete && saw_complete),
+        "closure fixtures missed accepted spans"
+    );
+
+    let begin = Event {
+        at: epoch,
+        phase: Phase::Begin,
+        name: Name::Output,
+        run: Some(RunId(NonZeroU64::new(1).unwrap())),
+        thread: ThreadTag { tid: 1, name: None },
+        args: Args::default(),
+    };
+    let replacement = Event {
+        thread: ThreadTag {
+            tid: u64::MAX,
+            name: Some("handy-recorder-delivery"),
+        },
+        ..begin
+    };
+    let end = Event {
+        phase: Phase::End,
+        ..replacement
+    };
+    let large = maximal(Phase::Instant, 0);
+    let small = Event {
+        phase: Phase::Instant,
+        run: None,
+        ..begin
+    };
+    let rich_end = Event {
+        phase: Phase::End,
+        args: large.args,
+        ..end
+    };
+    let inputs = [
+        vec![begin, replacement],
+        vec![begin, replacement, end],
+        vec![begin, rich_end],
+        vec![begin, large, small],
+    ];
+    let mut transitions = 0;
+    let mut saw_replacement = false;
+    let mut saw_rejected_end = false;
+    let mut saw_later_small = false;
+    for cap in (512..=2048).step_by(7) {
+        for (case, input) in inputs.iter().enumerate() {
+            match writer_events(input, epoch, cap, config(), 0) {
+                Ok(Some(output)) => {
+                    let actual = events(&output.trace);
+                    let accepted: Vec<_> = actual
+                        .iter()
+                        .filter(|event| event["args"]["incomplete"] != true)
+                        .collect();
+                    if case == 0 && output.written == 2 {
+                        saw_replacement = true;
+                        assert_eq!(actual.last().unwrap()["tid"], u64::MAX);
+                    }
+                    saw_rejected_end |= case == 2 && output.written == 1 && output.incomplete == 1;
+                    saw_later_small |= case == 3 && output.written == 2 && accepted[1]["tid"] == 1;
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(error),
+            }
+            transitions += 1;
+        }
+    }
+    assert!(
+        !failures.is_empty() || (saw_replacement && saw_rejected_end && saw_later_small),
+        "transition fixtures missed replacement, rejected end, or later small event"
+    );
+    println!("EXHAUSTED reservation transition inputs: {transitions}");
+
+    let mut escaped = config();
+    escaped.model = "\\\"\n".repeat(2048);
+    for cap in [0, 512, 4096, 32_768] {
+        match writer_events(&[begin, end], epoch, cap, escaped.clone(), u64::MAX) {
+            Ok(Some(output)) => {
+                assert_eq!(output.trace["otherData"]["config"]["model"], escaped.model);
+                assert_eq!(output.written, 2);
+            }
+            Ok(None) if cap < 32_768 => {}
+            Ok(None) => failures.push("escaped config rejected with ample cap".into()),
+            Err(error) => failures.push(error),
+        }
+    }
+    println!("EXHAUSTED escaped-config inputs: 4");
+    for failure in failures.iter().take(5) {
+        println!("COUNTEREXAMPLE resource: {failure}");
+    }
+    assert!(
+        failures.is_empty(),
+        "finished capture exceeds resource limits; violations={}",
+        failures.len()
+    );
 }
