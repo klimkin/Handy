@@ -1,0 +1,16 @@
+[package]
+name = "handy-recording-lifecycle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+loom = "=0.7.2"
+
+[build-dependencies]
+proc-macro2 = "1"
+prettyplease = "0.2"
+quote = "1"
+syn = { version = "2", features = ["full", "visit", "visit-mut"] }
+
+[workspace]
