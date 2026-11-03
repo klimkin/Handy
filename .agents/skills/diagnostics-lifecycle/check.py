@@ -4,7 +4,6 @@
 import argparse
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
@@ -12,8 +11,29 @@ import tempfile
 
 SKILL = Path(__file__).resolve().parent
 ROOT = SKILL.parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from formal_verdict import verify
+
 SOURCE = Path("src-tauri/src/diagnostics.rs")
 TARGET = ROOT / "target" / "diagnostics-lifecycle"
+PROPERTIES = {
+    "race::stop_admission_interleavings": (
+        "stop did not finish after detaching capture",
+        "stop lost admitted event at detach boundary",
+    ),
+    "real::stop_drains_admitted": (
+        "emission accounting lost an input",
+        "stop lost admitted event in real writer",
+    ),
+    "real::stale_timestamp_rejected": ("pre-epoch event admitted into new capture",),
+    "real::old_span_isolation": ("old span entered newer capture",),
+    "real::writer_drain_inputs": ("writer lost admitted event", "event byte budget bypassed"),
+    "real::accepted_event_budget": ("event byte budget bypassed",),
+    "real::total_capture_resource_limit": (
+        "finished capture exceeds resource limits",
+        "event byte budget bypassed",
+    ),
+}
 
 
 def run(root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -24,6 +44,8 @@ def run(root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]
     if test:
         command.append(test)
     command += ["--", "--nocapture", "--test-threads=1"]
+    if test:
+        command.append("--exact")
     return subprocess.run(
         command, cwd=ROOT,
         env=os.environ | {"HANDY_FORMAL_SOURCE_ROOT": str(root)},
@@ -31,25 +53,12 @@ def run(root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]
     )
 
 
-def verdict(result: subprocess.CompletedProcess[str], total: int) -> int:
-    summary = re.search(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;", result.stdout)
-    if not summary or int(summary[2]) + int(summary[3]) != total:
-        raise RuntimeError("tests did not complete expected input/schedule bounds")
-    if result.returncode == 0 and summary[1] == "ok":
-        return 0
-    if result.returncode == 101 and summary[1] == "FAILED":
-        if "Model exceeded" in result.stdout or "execution limit" in result.stdout:
-            raise RuntimeError("Loom did not exhaust schedules")
-        return 1
-    raise RuntimeError(f"unexpected cargo result {result.returncode}")
-
-
 def baseline(label: str) -> int:
     result = run(ROOT)
     TARGET.mkdir(parents=True, exist_ok=True)
     (TARGET / f"{label}.log").write_text(result.stdout)
     print(result.stdout, end="", flush=True)
-    status = verdict(result, 7)
+    status = verify(result, PROPERTIES)
     if "EXHAUSTED stop admission schedules:" not in result.stdout:
         raise RuntimeError("Loom schedule exhaustion was not reported")
     return status
@@ -58,9 +67,9 @@ def baseline(label: str) -> int:
 def mutations() -> None:
     source = (ROOT / SOURCE).read_text()
     cases = [
-        ("stop_early", "writer_drain_inputs", "for ev in self.rx {", "for ev in self.rx.into_iter().take(1) {", "writer lost admitted event"),
-        ("accept_pre_epoch", "stale_timestamp_rejected", "if ev.at < cap.epoch {", "if false {", "pre-epoch event admitted into new capture"),
-        ("ignore_event_budget", "accepted_event_budget", "if bytes + line.len() as u64 + sep_len + 1 > self.byte_cap {", "if false {", "event byte budget bypassed"),
+        ("stop_early", "real::writer_drain_inputs", "for ev in self.rx {", "for ev in self.rx.into_iter().take(1) {", "writer lost admitted event"),
+        ("accept_pre_epoch", "real::stale_timestamp_rejected", "if ev.at < cap.epoch {", "if false {", "pre-epoch event admitted into new capture"),
+        ("ignore_event_budget", "real::accepted_event_budget", "if bytes + line.len() as u64 + sep_len + 1 > self.byte_cap {", "if false {", "event byte budget bypassed"),
     ]
     for name, test, old, new, message in cases:
         if source.count(old) != 1:
@@ -74,7 +83,7 @@ def mutations() -> None:
             result = run(root, test)
         (TARGET / f"{name}.rs").write_text(changed)
         (TARGET / f"{name}.log").write_text(result.stdout)
-        if verdict(result, 1) != 1 or message not in result.stdout:
+        if verify(result, {test: (message,)}) != 1:
             print(result.stdout, end="", flush=True)
             raise RuntimeError(f"{name}: real-source mutation did not trigger its assertion")
         print(f"CAUGHT {name}: {message}", flush=True)

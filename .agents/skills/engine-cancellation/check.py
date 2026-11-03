@@ -11,8 +11,23 @@ import tempfile
 
 SKILL = Path(__file__).resolve().parent
 ROOT = SKILL.parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from formal_verdict import verify
+
 SOURCE = Path("src-tauri/src/engine_supervisor/supervisor.rs")
 TARGET = ROOT / "target" / "engine-cancellation"
+PROPERTIES = {
+    "cancel_stops_hung_marked_work": (
+        "cancel returned but marked work was neither rejected nor killed",
+        "cancelled call returned a successful reply",
+        "cancel killed an unpublished worker",
+    ),
+    "cancel_rejects_buffered_reply": (
+        "cancelled call returned a successful reply",
+        "cancel killed an unpublished worker",
+    ),
+    "fresh_mark_runs_after_cancel": (),
+}
 
 
 def run(source_root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -23,6 +38,8 @@ def run(source_root: Path, test: str | None = None) -> subprocess.CompletedProce
     if test:
         command.append(test)
     command.extend(["--", "--nocapture", "--test-threads=1"])
+    if test:
+        command.append("--exact")
     environment = os.environ | {"HANDY_FORMAL_SOURCE_ROOT": str(source_root)}
     return subprocess.run(
         command, cwd=ROOT, env=environment, text=True,
@@ -30,11 +47,12 @@ def run(source_root: Path, test: str | None = None) -> subprocess.CompletedProce
     )
 
 
-def baseline() -> None:
+def baseline() -> int:
     result = run(ROOT)
     print(result.stdout, end="", flush=True)
-    if result.returncode or "3 passed; 0 failed" not in result.stdout:
-        raise RuntimeError("production cancellation check did not complete all three scenarios")
+    TARGET.mkdir(parents=True, exist_ok=True)
+    (TARGET / "baseline.log").write_text(result.stdout)
+    return verify(result, PROPERTIES)
 
 
 def mutations() -> None:
@@ -77,7 +95,7 @@ def mutations() -> None:
         TARGET.mkdir(parents=True, exist_ok=True)
         (TARGET / f"{name}.log").write_text(result.stdout)
         (TARGET / f"{name}.rs").write_text(text.replace(old, new, 1))
-        if result.returncode == 0 or expected not in result.stdout or "test result: FAILED" not in result.stdout:
+        if verify(result, {test: (expected,)}) != 1:
             print(result.stdout, end="", flush=True)
             raise RuntimeError(f"{name}: expected property assertion did not fail")
         print(f"CAUGHT {name}: {expected}", flush=True)
@@ -88,14 +106,15 @@ def main() -> int:
     parser.add_argument("--mutations", action="store_true", help="also prove checks reject three source mutations")
     arguments = parser.parse_args()
     try:
-        baseline()
+        status = baseline()
         if arguments.mutations:
             mutations()
-            baseline()
+            if baseline() != status:
+                raise RuntimeError("restored source changed property verdict")
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"INCOMPLETE: {error}", file=sys.stderr)
-        return 1
-    return 0
+        return 2
+    return status
 
 
 if __name__ == "__main__":

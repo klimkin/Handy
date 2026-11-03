@@ -4,15 +4,45 @@
 import argparse
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
 
 SKILL = Path(__file__).resolve().parent
 ROOT = SKILL.parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from formal_verdict import verify
+
 SOURCE = Path("src-tauri/src/engine_supervisor/supervisor.rs")
 TARGET = ROOT / "target/engine-lifecycle"
+PROPERTIES = {
+    "previous_worker_exits_before_replacement": (
+        "replacement started before previous worker exited and was reaped",
+        "unload acknowledged before worker was reaped",
+    ),
+    "unload_acknowledgement_follows_reaping": ("unload acknowledged before worker was reaped",),
+    "pending_unload_blocks_late_publication": ("pending unload resurrected loaded model",),
+    "load_recovery_is_bounded_and_respects_selection": (
+        "model load retry exceeded two attempts",
+        "explicit selection silently fell back",
+        "GPU recovery did not use CPU-only worker",
+        "CPU choice registered GPU backend",
+        "load recovery skipped or added an attempt",
+        "load recovery lost its native result",
+        "unload acknowledged before worker was reaped",
+    ),
+    "transcription_retry_is_bounded": (
+        "transcription retry exceeded two attempts",
+        "failure bypassed no-retry policy",
+        "cancelled transcription lost cancellation",
+        "cancellation entered GPU recovery",
+        "unload acknowledged before worker was reaped",
+    ),
+    "cancelled_queued_work_never_starts": ("old queued work started after cancel",),
+    "persisted_gpu_choice_never_falls_back": (
+        "persisted explicit GPU selection silently fell back to CPU",
+    ),
+}
 
 
 def run(root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -28,22 +58,12 @@ def run(root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]
                           text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
 
 
-def verdict(result: subprocess.CompletedProcess[str], count: int) -> int:
-    match = re.search(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored", result.stdout)
-    if not match or int(match[1]) + int(match[2]) != count or int(match[3]):
-        raise RuntimeError("requested property checks did not all finish")
-    failed = bool(int(match[2]))
-    if result.returncode != (101 if failed else 0):
-        raise RuntimeError(f"unexpected cargo status {result.returncode}")
-    return int(failed)
-
-
 def baseline() -> int:
     result = run(ROOT)
     print(result.stdout, end="", flush=True)
     TARGET.mkdir(parents=True, exist_ok=True)
     (TARGET / "baseline.log").write_text(result.stdout)
-    return verdict(result, 7)
+    return verify(result, PROPERTIES)
 
 
 def mutations() -> None:
@@ -95,7 +115,7 @@ def mutations() -> None:
             result = run(root, test)
         (TARGET / f"{name}.log").write_text(result.stdout)
         (TARGET / f"{name}.rs").write_text(changed)
-        if verdict(result, 1) != 1 or expected not in result.stdout:
+        if verify(result, {test: (expected,)}) != 1:
             print(result.stdout, end="", flush=True)
             raise RuntimeError(f"{name}: expected property assertion did not fail")
         print(f"CAUGHT {name}: {expected}", flush=True)

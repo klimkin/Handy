@@ -12,12 +12,45 @@ import tempfile
 
 SKILL = Path(__file__).resolve().parent
 ROOT = SKILL.parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from formal_verdict import verify
+
 MANAGER = Path("src-tauri/src/managers/transcription.rs")
 ENGINE = Path("src-tauri/src/engine_supervisor/supervisor.rs")
 AUDIO = Path("src-tauri/src/managers/audio.rs")
 SINK = Path("src-tauri/src/audio_toolkit/audio/sink.rs")
 ACTIONS = Path("src-tauri/src/actions.rs")
 TARGET = ROOT / "target" / "stream-ownership"
+PROPERTIES = {
+    "engine::cancelled_finalize_never_falls_back": (
+        "PROPERTY finalize: observed cancel became batch fallback",
+        "PROPERTY finalize: cancelled finalize dispatched work",
+        "PROPERTY finalize: old cancelled finalize removed replacement stream",
+        "PROPERTY finalize-boundary: worker cancel became batch fallback",
+        "PROPERTY finalize: cancelled worker stream was not reset",
+    ),
+    "engine::frames_cannot_reach_replaced_stream": (
+        "PROPERTY feed: frame crossed stream id/closed/cancel/worker fence",
+    ),
+    "engine::handle_preserves_cancelled_finalize": (
+        "PROPERTY handle-finalize: cancellation became batch fallback",
+    ),
+    "engine::uncancelled_finalize_retains_fallback": (
+        "PROPERTY fallback: uncancelled finalize returned wrong usable result",
+        "PROPERTY fallback: uncancelled finalize returned wrong batch fallback",
+    ),
+    "manager::guard_cannot_clear_replacement": (
+        "PROPERTY guard: old cleanup cleared replacement worker state",
+        "PROPERTY guard: old cleanup must retire token 1",
+    ),
+    "manager::manager_preserves_cancelled_finalize": (
+        "PROPERTY manager-finalize: cancellation became batch fallback",
+    ),
+    "manager::stalled_old_callback_cannot_feed_replacement": (
+        "PROPERTY router: old recording frame reached replacement route",
+        "PROPERTY router: replacement dropped its fresh frame",
+    ),
+}
 
 
 def recorder_source() -> Path:
@@ -45,6 +78,8 @@ def run(source_root: Path, test: str | None = None) -> subprocess.CompletedProce
     if test:
         command.append(test)
     command.extend(["--", "--nocapture", "--test-threads=1"])
+    if test:
+        command.append("--exact")
     return subprocess.run(
         command, cwd=ROOT, env=os.environ | {
             "HANDY_FORMAL_SOURCE_ROOT": str(source_root),
@@ -59,12 +94,10 @@ def baseline() -> int:
     print(result.stdout, end="", flush=True)
     TARGET.mkdir(parents=True, exist_ok=True)
     (TARGET / "baseline.log").write_text(result.stdout)
-    if result.returncode == 0 and "7 passed; 0 failed" in result.stdout:
-        return 0
-    if "test result: FAILED" in result.stdout and "PROPERTY " in result.stdout:
+    status = verify(result, PROPERTIES)
+    if status:
         print("FINDING: current production code violates stream property", flush=True)
-        return 1
-    raise RuntimeError("baseline did not complete seven checks; inspect baseline.log")
+    return status
 
 
 def mutations() -> None:
@@ -100,25 +133,25 @@ def mutations() -> None:
                 Err(EngineError::Cancelled)
             }"""
     cases = [
-        ("retire_token_before_flag", MANAGER, "guard_cannot_clear_replacement", guard,
+        ("retire_token_before_flag", MANAGER, "manager::guard_cannot_clear_replacement", guard,
          reordered_guard, "PROPERTY guard: old cleanup cleared replacement worker state"),
-        ("remove_feed_id_fence", ENGINE, "frames_cannot_reach_replaced_stream",
+        ("remove_feed_id_fence", ENGINE, "engine::frames_cannot_reach_replaced_stream",
          "self.stream.as_ref().filter(|s| s.id == id)", "self.stream.as_ref()",
          "PROPERTY feed: frame crossed stream id/closed/cancel/worker fence"),
-        ("remove_early_cancel", ENGINE, "cancelled_finalize_never_falls_back",
+        ("remove_early_cancel", ENGINE, "engine::cancelled_finalize_never_falls_back",
          early_cancel, "", "PROPERTY finalize: observed cancel became batch fallback"),
-        ("swallow_worker_cancel", ENGINE, "cancelled_finalize_never_falls_back",
+        ("swallow_worker_cancel", ENGINE, "engine::cancelled_finalize_never_falls_back",
          boundary_cancel, "            Err(Failure::Cancelled) => Ok(None),",
          "PROPERTY finalize-boundary: worker cancel became batch fallback"),
-        ("swallow_manager_cancel", MANAGER, "manager_preserves_cancelled_finalize",
+        ("swallow_manager_cancel", MANAGER, "manager::manager_preserves_cancelled_finalize",
          "            Ok(Err(e)) => Err(e.into()),",
          "            Ok(Err(_)) => Ok(None),",
          "PROPERTY manager-finalize: cancellation became batch fallback"),
-        ("swallow_handle_cancel", ENGINE, "handle_preserves_cancelled_finalize",
+        ("swallow_handle_cancel", ENGINE, "engine::handle_preserves_cancelled_finalize",
          "        answer.recv().unwrap_or(Ok(None))",
          "        answer.recv().unwrap_or(Ok(None)).or(Ok(None))",
          "PROPERTY handle-finalize: cancellation became batch fallback"),
-        ("drop_router_frames", MANAGER, "stalled_old_callback_cannot_feed_replacement",
+        ("drop_router_frames", MANAGER, "manager::stalled_old_callback_cannot_feed_replacement",
          "            let _ = route.tx.send(StreamCmd::Feed(frame.to_vec()));",
          "            let _ = frame;",
          "PROPERTY router: replacement dropped its fresh frame"),
@@ -139,9 +172,12 @@ def mutations() -> None:
         TARGET.mkdir(parents=True, exist_ok=True)
         (TARGET / f"{name}.log").write_text(result.stdout)
         (TARGET / f"{name}.rs").write_text(mutated)
-        if result.returncode == 0 or expected not in result.stdout or "test result: FAILED" not in result.stdout:
+        try:
+            if verify(result, {test: (expected,)}) != 1:
+                raise RuntimeError("property assertion did not reject executable mutation")
+        except RuntimeError as error:
             print(result.stdout, end="", flush=True)
-            errors.append(f"{name}: property assertion did not reject executable mutation")
+            errors.append(f"{name}: {error}")
         else:
             print(f"CAUGHT {name}: {expected}", flush=True)
     if errors:

@@ -4,7 +4,6 @@
 import argparse
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
@@ -12,7 +11,29 @@ import tempfile
 
 SKILL = Path(__file__).resolve().parent
 ROOT = SKILL.parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from formal_verdict import verify
+
 TARGET = ROOT / "target" / "recording-lifecycle"
+PROPERTIES = {
+    "busy_cancel_removes_pending_start": ("cancel retained pending start",),
+    "busy_other_binding_preserves_remembered_press": ("another binding replaced remembered press",),
+    "busy_toggle_parity_exhaustive": ("busy toggle parity changed",),
+    "cancellation_before_paste_thread_prevents_commitment": ("cancelled generation reached paste commitment",),
+    "ended_readiness_rejects_chime": ("ended readiness played start chime",),
+    "ended_readiness_rejects_mute": ("ended readiness muted newer session",),
+    "ended_readiness_rejects_ui": ("ended readiness changed newer UI",),
+    "failed_start_rolls_coordinator_back": (
+        "failed start left coordinator recording",
+        "failed start retained hold",
+        "failed start prevented retry",
+        "failed start emitted started phase",
+    ),
+    "observed_cancel_prevents_paste_commitment": ("observed cancellation reached paste commitment",),
+    "readiness_chime_never_follows_ended_session": ("ended readiness played start chime",),
+    "readiness_mute_never_changes_newer_session": ("ended readiness muted newer session",),
+    "readiness_ui_never_changes_newer_session": ("ended readiness changed newer UI",),
+}
 COORDINATOR = Path("src-tauri/src/transcription_coordinator.rs")
 AUDIO = Path("src-tauri/src/managers/audio.rs")
 ACTIONS = Path("src-tauri/src/actions.rs")
@@ -36,22 +57,12 @@ def run(root: Path, test: str | None = None) -> subprocess.CompletedProcess[str]
     )
 
 
-def summary(result: subprocess.CompletedProcess[str], count: int) -> int:
-    match = re.search(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored", result.stdout)
-    if not match or sum(map(int, match.groups()[:2])) != count or int(match[3]):
-        raise RuntimeError("checker did not finish every requested test")
-    failed = int(match[2])
-    if result.returncode != (101 if failed else 0):
-        raise RuntimeError(f"unexpected cargo exit {result.returncode}")
-    return int(bool(failed))
-
-
 def baseline() -> int:
     result = run(ROOT)
     print(result.stdout, end="", flush=True)
     TARGET.mkdir(parents=True, exist_ok=True)
     (TARGET / "baseline.log").write_text(result.stdout)
-    return summary(result, 12)
+    return verify(result, PROPERTIES)
 
 
 def mutations() -> None:
@@ -102,8 +113,8 @@ def mutations() -> None:
         (TARGET / f"{name}.log").write_text(result.stdout)
         (TARGET / f"{name}.rs").write_text(changed)
         try:
-            failed = summary(result, 1)
-            if not failed or expected not in result.stdout:
+            failed = verify(result, {test: (expected,)})
+            if not failed:
                 raise RuntimeError("expected property assertion did not fail")
         except RuntimeError as error:
             print(result.stdout, end="", flush=True)

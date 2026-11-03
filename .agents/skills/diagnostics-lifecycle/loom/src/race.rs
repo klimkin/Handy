@@ -66,7 +66,13 @@ fn stop_admission_interleavings() {
     }));
     let admission_counts = admissions.clone();
     let mut model = loom::model::Builder::new();
+    model.max_threads = 3;
     model.max_branches = 1000;
+    model.max_permutations = None;
+    model.max_duration = None;
+    model.preemption_bound = None;
+    model.checkpoint_file = None;
+    model.expect_explicit_explore = false;
     model.check(move || {
         let epoch = Instant::now();
         let recorder = Recorder::new();
