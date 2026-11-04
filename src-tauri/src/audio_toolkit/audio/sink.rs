@@ -98,8 +98,6 @@ pub struct CaptureSink {
     run: RunId,
     saw_vad: bool,
     saw_speech: bool,
-    /// Pre-roll frames replayed ahead of the live audio, counted on the
-    /// first-audio event.
     replayed_frames: u64,
 }
 
@@ -155,8 +153,6 @@ impl CaptureSink {
         self.vad.frame_samples()
     }
 
-    /// The first `frames` this sink is fed are pre-roll from before the
-    /// press.
     pub(super) fn set_replayed_frames(&mut self, frames: u64) {
         self.replayed_frames = frames;
     }
