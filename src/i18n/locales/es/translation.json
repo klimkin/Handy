@@ -672,10 +672,7 @@
             "unknownModel": "This model is not offered.",
             "modelNotDownloaded": "The model is not downloaded yet.",
             "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device.",
-            "generateFailed": "The model failed while cleaning a transcript.",
-            "emptyOutput": "The model returned no text.",
-            "promptTooLong": "The transcript is too long for the NPU."
+            "deviceFailed": "The model could not load on this device. Try another device."
           }
         },
         "baseUrl": {

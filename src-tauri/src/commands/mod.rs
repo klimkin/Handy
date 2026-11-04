@@ -4,11 +4,12 @@ pub mod history;
 pub mod models;
 pub mod transcription;
 
+use crate::openvino_cleaner::{LoadError, OpenVinoCleaner};
 use crate::settings::{
     get_settings, update_checks_forced_disabled, write_settings, AppSettings, LogLevel,
 };
 use crate::utils::cancel_current_operation;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -134,6 +135,17 @@ pub fn check_apple_intelligence_available() -> bool {
     {
         false
     }
+}
+
+/// Load the OpenVINO cleanup model on the selected device.
+/// Called by the frontend to show whether the OpenVINO provider is ready.
+#[specta::specta]
+#[tauri::command]
+pub async fn prepare_openvino_cleaner(
+    app: AppHandle,
+    cleaner: State<'_, OpenVinoCleaner>,
+) -> Result<(), LoadError> {
+    cleaner.prepare(&get_settings(&app)).await
 }
 
 /// Try to initialize Enigo (keyboard/mouse simulation).

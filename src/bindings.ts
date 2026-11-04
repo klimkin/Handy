@@ -431,6 +431,14 @@ async changeChineseScriptSetting(script: ChineseScript) : Promise<Result<null, s
     else return { status: "error", error: e  as any };
 }
 },
+async changeOpenvinoDeviceSetting(device: OpenVinoDevice) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_openvino_device_setting", { device }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeAppLanguageSetting(language: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_app_language_setting", { language }) };
@@ -667,6 +675,18 @@ async checkAppleIntelligenceAvailable() : Promise<boolean> {
     return await TAURI_INVOKE("check_apple_intelligence_available");
 },
 /**
+ * Load the OpenVINO cleanup model on the selected device.
+ * Called by the frontend to show whether the OpenVINO provider is ready.
+ */
+async prepareOpenvinoCleaner() : Promise<Result<null, LoadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prepare_openvino_cleaner") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Try to initialize Enigo (keyboard/mouse simulation).
  * On macOS, this will return an error if accessibility permissions are not granted.
  */
@@ -735,6 +755,18 @@ async downloadModel(modelId: string) : Promise<Result<null, string>> {
 async downloadLanguageDetector() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("download_language_detector") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Download an OpenVINO cleanup model. Progress, completion, cancellation and
+ * failure use the model download events under the model's id.
+ */
+async downloadOpenvinoModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_openvino_model", { modelId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1070,30 +1102,6 @@ async dismissNotice(source: NoticeSource, code: NoticeCode) : Promise<void> {
  */
 async dismissOverlayNotice() : Promise<void> {
     await TAURI_INVOKE("dismiss_overlay_notice");
-},
-async prepareOpenvinoCleaner() : Promise<Result<null, CleanerError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("prepare_openvino_cleaner") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async downloadOpenvinoModel(modelId: string) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("download_openvino_model", { modelId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async changeOpenvinoDeviceSetting(device: OpenVinoDevice) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("change_openvino_device_setting", { device }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
 }
 }
 
@@ -1120,8 +1128,8 @@ transcriptionJob: "transcription-job"
 
 /** user-defined constants **/
 
-export const OPENVINO_PROVIDER_ID = "openvino" as const;
 export const APPLE_INTELLIGENCE_PROVIDER_ID = "apple_intelligence" as const;
+export const OPENVINO_PROVIDER_ID = "openvino" as const;
 
 /** user-defined types **/
 
@@ -1249,7 +1257,6 @@ export type ChineseScript =
  * Traditional, in Hong Kong's standard forms.
  */
 "traditional_hk"
-export type CleanerError = "unknown_model" | "model_not_downloaded" | "library_missing" | "device_failed" | "generate_failed" | "empty_output" | "prompt_too_long"
 export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
 export type CustomSounds = { start: boolean; stop: boolean }
 /**
@@ -1351,6 +1358,10 @@ export type LanguageStatus =
  * Auto can't work here; `language` is used instead.
  */
 { kind: "auto_unavailable"; language: string; reason: AutoUnavailableReason }
+/**
+ * Why the model could not be loaded. The settings screen shows each one.
+ */
+export type LoadError = "unknown_model" | "model_not_downloaded" | "library_missing" | "device_failed"
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
 export type ModelInfo = { id: string; name: string; description: string; filename: string; source: ModelSource; size_mb: number; is_downloaded: boolean; is_downloading: boolean; partial_size: number; accuracy_score: number; speed_score: number; supports_translation: boolean; is_recommended: boolean; supported_languages: string[]; supports_language_selection: boolean; is_custom: boolean; supports_streaming: boolean; supports_language_detection: boolean }
 export type ModelLoadStatus = { is_loaded: boolean; current_model: string | null }
@@ -1412,6 +1423,9 @@ notices: Notice[];
  * `None` when a notice was cleared.
  */
 raised: Notice | null }
+/**
+ * Where the OpenVINO provider runs its cleanup model.
+ */
 export type OpenVinoDevice = "npu" | "gpu" | "cpu"
 export type OverlayPosition = "top" | "bottom"
 /**

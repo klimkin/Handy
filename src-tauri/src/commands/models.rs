@@ -1,6 +1,7 @@
 use crate::managers::model::{ModelInfo, ModelManager, RetiredModel, LANGUAGE_DETECTOR_ID};
 use crate::managers::transcription::{ModelStateEvent, TranscriptionManager};
 use crate::notices::{self, NoticeSource};
+use crate::openvino_cleaner::{offered_model, LoadError};
 use crate::settings::{get_settings, write_settings, ModelUnloadTimeout};
 use log::error;
 use std::sync::Arc;
@@ -87,6 +88,37 @@ pub async fn download_language_detector(
         let _ = app_handle.emit(
             "model-download-failed",
             serde_json::json!({ "model_id": LANGUAGE_DETECTOR_ID, "error": error }),
+        );
+    }
+    result
+}
+
+/// Download an OpenVINO cleanup model. Progress, completion, cancellation and
+/// failure use the model download events under the model's id.
+#[tauri::command]
+#[specta::specta]
+pub async fn download_openvino_model(
+    app_handle: AppHandle,
+    model_manager: State<'_, Arc<ModelManager>>,
+    model_id: String,
+) -> Result<(), String> {
+    let model = offered_model(&model_id).ok_or_else(|| LoadError::UnknownModel.to_string())?;
+    let result = model_manager
+        .download_hf_snapshot(
+            model.id,
+            model.label,
+            model.repo,
+            model.revision,
+            model.files,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    if let Err(ref error) = result {
+        error!("OpenVINO model download failed for {}: {}", model.id, error);
+        let _ = app_handle.emit(
+            "model-download-failed",
+            serde_json::json!({ "model_id": model.id, "error": error }),
         );
     }
     result

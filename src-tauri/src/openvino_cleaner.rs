@@ -1,6 +1,6 @@
-use crate::managers::model::{hf_snapshot_dirs, ModelManager};
+use crate::managers::model::hf_snapshot_dirs;
 use crate::settings::{
-    self, AppSettings, OpenVinoDevice, OPENVINO_DEFAULT_MODEL_ID, OPENVINO_PROVIDER_ID,
+    AppSettings, OpenVinoDevice, OPENVINO_DEFAULT_MODEL_ID, OPENVINO_PROVIDER_ID,
 };
 use log::{error, info, warn};
 use openvino_genai::{GenerationConfig, LlmPipeline};
@@ -9,7 +9,6 @@ use specta::Type;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use tauri::{AppHandle, Emitter, State};
 
 /// NPU static shapes, in tokens. Unmeasured proposals, not crate requirements.
 const MAX_PROMPT_LEN: usize = 1024;
@@ -54,7 +53,7 @@ pub const OFFERED_MODELS: &[OfferedModel] = &[OfferedModel {
     ],
 }];
 
-fn offered_model(id: &str) -> Option<&'static OfferedModel> {
+pub fn offered_model(id: &str) -> Option<&'static OfferedModel> {
     OFFERED_MODELS.iter().find(|model| model.id == id)
 }
 
@@ -93,9 +92,10 @@ impl OpenVinoCleaner {
     }
 
     /// Loads the selected model on the selected device without generating.
-    pub async fn prepare(&self, settings: &AppSettings) -> Result<(), CleanerError> {
+    pub async fn prepare(&self, settings: &AppSettings) -> Result<(), LoadError> {
         let key = resolve_key(settings)?;
-        self.with_pipeline(key, |_| Ok(())).await
+        self.with_pipeline(key, |_| Ok(()), LoadError::DeviceFailed)
+            .await
     }
 
     pub async fn clean(
@@ -107,8 +107,12 @@ impl OpenVinoCleaner {
         let prompt = fill_prompt(template, transcription);
         check_prompt_budget(settings.post_process_openvino_device, &prompt)?;
         let key = resolve_key(settings)?;
-        self.with_pipeline(key, move |pipeline| generate(pipeline, &prompt))
-            .await
+        self.with_pipeline(
+            key,
+            move |pipeline| generate(pipeline, &prompt),
+            CleanerError::GenerateFailed,
+        )
+        .await
     }
 
     pub fn unload(&self) {
@@ -118,21 +122,22 @@ impl OpenVinoCleaner {
         });
     }
 
-    async fn with_pipeline<T, F>(&self, key: LoadKey, work: F) -> Result<T, CleanerError>
+    async fn with_pipeline<T, E, F>(&self, key: LoadKey, work: F, panicked: E) -> Result<T, E>
     where
         T: Send + 'static,
-        F: FnOnce(&mut LlmPipeline) -> Result<T, CleanerError> + Send + 'static,
+        E: From<LoadError> + Send + 'static,
+        F: FnOnce(&mut LlmPipeline) -> Result<T, E> + Send + 'static,
     {
         let slot = Arc::clone(&self.slot);
         let cache_dir = self.cache_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut slot = lock_slot(&slot);
-            load_or_reuse(&mut slot, key, &cache_dir).and_then(work)
+            work(load_or_reuse(&mut slot, key, &cache_dir)?)
         })
         .await
         .unwrap_or_else(|e| {
             error!("OpenVINO worker panicked: {e}");
-            Err(CleanerError::GenerateFailed)
+            Err(panicked)
         })
     }
 }
@@ -141,14 +146,14 @@ fn lock_slot(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn resolve_key(settings: &AppSettings) -> Result<LoadKey, CleanerError> {
+fn resolve_key(settings: &AppSettings) -> Result<LoadKey, LoadError> {
     let model_id = settings
         .post_process_models
         .get(OPENVINO_PROVIDER_ID)
         .map(String::as_str)
         .unwrap_or_default();
-    let model = offered_model(model_id).ok_or(CleanerError::UnknownModel)?;
-    let dir = ModelDir::find(model).ok_or(CleanerError::ModelNotDownloaded)?;
+    let model = offered_model(model_id).ok_or(LoadError::UnknownModel)?;
+    let dir = ModelDir::find(model).ok_or(LoadError::ModelNotDownloaded)?;
     Ok((dir, settings.post_process_openvino_device))
 }
 
@@ -156,7 +161,7 @@ fn load_or_reuse<'a>(
     slot: &'a mut Slot,
     key: LoadKey,
     cache_dir: &Path,
-) -> Result<&'a mut LlmPipeline, CleanerError> {
+) -> Result<&'a mut LlmPipeline, LoadError> {
     let reusable = matches!(&*slot, Slot::Loaded { key: loaded, .. } if *loaded == key);
     if !reusable {
         // Dropped before compiling so two models never sit on the device.
@@ -166,14 +171,14 @@ fn load_or_reuse<'a>(
     }
     match slot {
         Slot::Loaded { pipeline, .. } => Ok(pipeline),
-        Slot::Empty => Err(CleanerError::DeviceFailed),
+        Slot::Empty => Err(LoadError::DeviceFailed),
     }
 }
 
-fn load_pipeline((dir, device): &LoadKey, cache_dir: &Path) -> Result<LlmPipeline, CleanerError> {
+fn load_pipeline((dir, device): &LoadKey, cache_dir: &Path) -> Result<LlmPipeline, LoadError> {
     openvino_genai::load().map_err(|e| {
         warn!("OpenVINO GenAI library not found: {e}");
-        CleanerError::LibraryMissing
+        LoadError::LibraryMissing
     })?;
     let properties = load_properties(*device, &cache_dir.to_string_lossy());
     let properties: Vec<(&str, &str)> = properties
@@ -184,7 +189,7 @@ fn load_pipeline((dir, device): &LoadKey, cache_dir: &Path) -> Result<LlmPipelin
     info!("Loading {} on {device}", dir.0.display());
     LlmPipeline::with_properties(&dir.0.to_string_lossy(), device, &properties).map_err(|e| {
         error!("OpenVINO could not load the model on {device}: {e}");
-        CleanerError::DeviceFailed
+        LoadError::DeviceFailed
     })
 }
 
@@ -208,81 +213,57 @@ fn generate_failed(e: impl fmt::Display) -> CleanerError {
     CleanerError::GenerateFailed
 }
 
-#[tauri::command]
-#[specta::specta]
-pub async fn prepare_openvino_cleaner(
-    app: AppHandle,
-    cleaner: State<'_, OpenVinoCleaner>,
-) -> Result<(), CleanerError> {
-    cleaner.prepare(&settings::get_settings(&app)).await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn download_openvino_model(
-    app: AppHandle,
-    model_manager: State<'_, Arc<ModelManager>>,
-    model_id: String,
-) -> Result<(), String> {
-    let model = offered_model(&model_id).ok_or_else(|| CleanerError::UnknownModel.to_string())?;
-    model_manager
-        .download_hf_snapshot(
-            model.id,
-            model.label,
-            model.repo,
-            model.revision,
-            model.files,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            let error = e.to_string();
-            error!("OpenVINO model download failed for {}: {e:#}", model.id);
-            let _ = app.emit(
-                "model-download-failed",
-                serde_json::json!({ "model_id": model.id, "error": &error }),
-            );
-            error
-        })
-}
-
-#[tauri::command]
-#[specta::specta]
-pub fn change_openvino_device_setting(
-    app: AppHandle,
-    device: OpenVinoDevice,
-) -> Result<(), String> {
-    let mut settings = settings::get_settings(&app);
-    settings.post_process_openvino_device = device;
-    settings::write_settings(&app, settings);
-    Ok(())
-}
-
+/// Why the model could not be loaded. The settings screen shows each one.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "snake_case")]
-pub enum CleanerError {
+pub enum LoadError {
     UnknownModel,
     ModelNotDownloaded,
     LibraryMissing,
     DeviceFailed,
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LoadError::UnknownModel => "the selected model is not offered",
+            LoadError::ModelNotDownloaded => "the model is not downloaded",
+            LoadError::LibraryMissing => "the OpenVINO GenAI library was not found",
+            LoadError::DeviceFailed => "the model could not be loaded on the device",
+        })
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// Why a cleanup produced no text. Dictation reports these as the
+/// post-processing notice, so they stay in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanerError {
+    Load(LoadError),
     GenerateFailed,
     EmptyOutput,
     PromptTooLong,
 }
 
-impl fmt::Display for CleanerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            CleanerError::UnknownModel => "the selected model is not offered",
-            CleanerError::ModelNotDownloaded => "the model is not downloaded",
-            CleanerError::LibraryMissing => "the OpenVINO GenAI library was not found",
-            CleanerError::DeviceFailed => "the model could not be loaded on the device",
-            CleanerError::GenerateFailed => "generation failed",
-            CleanerError::EmptyOutput => "the model returned no text",
-            CleanerError::PromptTooLong => "the prompt is too long for the NPU",
-        })
+impl From<LoadError> for CleanerError {
+    fn from(error: LoadError) -> Self {
+        CleanerError::Load(error)
     }
 }
+
+impl fmt::Display for CleanerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CleanerError::Load(error) => error.fmt(f),
+            CleanerError::GenerateFailed => f.write_str("generation failed"),
+            CleanerError::EmptyOutput => f.write_str("the model returned no text"),
+            CleanerError::PromptTooLong => f.write_str("the prompt is too long for the NPU"),
+        }
+    }
+}
+
+impl std::error::Error for CleanerError {}
 
 /// The transcript replaces every `${output}`. A template without one still
 /// gets the transcript, on its own line at the end.

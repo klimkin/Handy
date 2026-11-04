@@ -740,6 +740,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_vad_backend_setting,
             shortcut::change_filler_word_removal_enabled_setting,
             shortcut::change_chinese_script_setting,
+            shortcut::change_openvino_device_setting,
             shortcut::change_app_language_setting,
             shortcut::change_update_checks_setting,
             shortcut::change_show_whats_new_on_update_setting,
@@ -771,6 +772,7 @@ pub fn run(cli_args: CliArgs) {
             commands::open_log_dir,
             commands::open_app_data_dir,
             commands::check_apple_intelligence_available,
+            commands::prepare_openvino_cleaner,
             commands::initialize_enigo,
             commands::initialize_shortcuts,
             commands::complete_onboarding,
@@ -778,6 +780,7 @@ pub fn run(cli_args: CliArgs) {
             commands::models::get_model_info,
             commands::models::download_model,
             commands::models::download_language_detector,
+            commands::models::download_openvino_model,
             commands::models::is_language_detector_downloaded,
             commands::models::delete_model,
             commands::models::get_retired_models,
@@ -823,9 +826,6 @@ pub fn run(cli_args: CliArgs) {
             notices::get_active_notices,
             notices::dismiss_notice,
             notices::dismiss_overlay_notice,
-            openvino_cleaner::prepare_openvino_cleaner,
-            openvino_cleaner::download_openvino_model,
-            openvino_cleaner::change_openvino_device_setting,
         ])
         .constant(
             "APPLE_INTELLIGENCE_PROVIDER_ID",

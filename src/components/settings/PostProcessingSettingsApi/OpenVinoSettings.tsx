@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { commands, type CleanerError, type OpenVinoDevice } from "@/bindings";
+import { commands, type LoadError, type OpenVinoDevice } from "@/bindings";
 import { Dropdown, SettingContainer } from "@/components/ui";
 import { Button } from "../../ui/Button";
 import { useSettings } from "../../../hooks/useSettings";
@@ -12,21 +12,18 @@ const DEVICE_LABEL_KEYS: Record<OpenVinoDevice, string> = {
   cpu: "settings.postProcessing.api.openVino.device.options.cpu",
 };
 
-const ERROR_LABEL_KEYS: Record<CleanerError, string> = {
+const ERROR_LABEL_KEYS: Record<LoadError, string> = {
   unknown_model: "settings.postProcessing.api.openVino.errors.unknownModel",
   model_not_downloaded:
     "settings.postProcessing.api.openVino.errors.modelNotDownloaded",
   library_missing: "settings.postProcessing.api.openVino.errors.libraryMissing",
   device_failed: "settings.postProcessing.api.openVino.errors.deviceFailed",
-  generate_failed: "settings.postProcessing.api.openVino.errors.generateFailed",
-  empty_output: "settings.postProcessing.api.openVino.errors.emptyOutput",
-  prompt_too_long: "settings.postProcessing.api.openVino.errors.promptTooLong",
 };
 
 type Readiness =
   | { status: "checking" }
   | { status: "ready" }
-  | { status: "failed"; error: CleanerError };
+  | { status: "failed"; error: LoadError };
 
 export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
   modelId,

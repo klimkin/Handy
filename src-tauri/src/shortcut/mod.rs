@@ -22,13 +22,13 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::openvino_cleaner::{OpenVinoCleaner, OFFERED_MODELS};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
-use crate::settings::OPENVINO_PROVIDER_ID;
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ChineseScript, ClipboardHandling, KeyboardImplementation,
     LLMPrompt, LanguageDetectionMode, OverlayPosition, OverlayStyle, PasteMethod,
     ShortcutActivation, ShortcutBinding, SoundTheme, Theme, TypingTool, VadBackend,
     APPLE_INTELLIGENCE_PROVIDER_ID,
 };
+use crate::settings::{OpenVinoDevice, OPENVINO_PROVIDER_ID};
 use crate::tray;
 
 // Note: Commands are accessed via shortcut::handy_keys:: in lib.rs
@@ -1481,6 +1481,18 @@ pub fn change_filler_word_removal_enabled_setting(
 pub fn change_chinese_script_setting(app: AppHandle, script: ChineseScript) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.chinese_script = script;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_openvino_device_setting(
+    app: AppHandle,
+    device: OpenVinoDevice,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.post_process_openvino_device = device;
     settings::write_settings(&app, settings);
     Ok(())
 }
