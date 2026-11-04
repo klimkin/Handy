@@ -5,7 +5,7 @@ mod mic_sink;
 mod microphone;
 mod sink;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod utils;
 mod visualizer;
 

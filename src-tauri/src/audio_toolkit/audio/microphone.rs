@@ -38,7 +38,7 @@ impl OpenMicrophone {
         Self::open_with(|on_failure| Recorder::open_with_failure_handler(config, on_failure))
     }
 
-    fn open_with(
+    pub(super) fn open_with(
         open: impl FnOnce(Box<dyn FnOnce(Error) + Send>) -> Result<Recorder<MicSink>, Error>,
     ) -> Result<Self, Error> {
         let failure = Arc::new(OnceLock::new());

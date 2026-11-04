@@ -4,31 +4,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use handy_recorder::testing::{FakeError, FakeMic};
-use handy_recorder::{EndReason, Recorder, RecorderConfig};
+use handy_recorder::{EndReason, Recorder};
 
 use super::{OpenMicrophone, Sealed};
 use crate::audio_toolkit::audio::mic_sink::HISTORY_FRAMES;
-use crate::audio_toolkit::audio::test_support::{ramp, recording, recording_with};
+use crate::audio_toolkit::audio::test_support::{
+    config, open, play, ramp, recording, recording_with, samples, while_running, BLOCK_FRAMES,
+    FRAMES, OPEN_TIMEOUT, SETTLE,
+};
 use crate::audio_toolkit::audio::{CaptureSink, VadPolicy};
-
-const FRAMES: usize = 512;
-const BLOCK_FRAMES: usize = 160;
-const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Time for the recorder's delivery thread to apply a start, or to file the
-/// audio pushed so far: a block pushed before the start applies is discarded.
-const SETTLE: Duration = Duration::from_millis(20);
-
-fn config() -> RecorderConfig {
-    RecorderConfig {
-        frames_per_chunk: Some(FRAMES),
-        ..RecorderConfig::speech()
-    }
-}
-
-fn open(fake: &FakeMic) -> OpenMicrophone {
-    OpenMicrophone::open_with(|on_failure| fake.open(config(), Some(on_failure), OPEN_TIMEOUT))
-        .expect("the fake microphone opens")
-}
 
 fn arm(mic: &OpenMicrophone) {
     mic.arm().expect("the microphone arms");
@@ -37,36 +21,6 @@ fn arm(mic: &OpenMicrophone) {
 
 fn post(mic: &OpenMicrophone, recording: CaptureSink) {
     assert!(mic.post(recording).is_ok(), "post refused");
-}
-
-fn play(fake: &FakeMic, channels: u16, first: usize, frames: usize) {
-    let samples: Vec<f32> = (first..first + frames)
-        .flat_map(|i| std::iter::repeat_n(i as f32, channels.into()))
-        .collect();
-    for block in samples.chunks(BLOCK_FRAMES * usize::from(channels)) {
-        assert!(fake.push(block), "the device is streaming");
-    }
-}
-
-/// Runs `stop` while the device keeps calling back, as a live device does:
-/// a stop waits for the next callback.
-fn while_running<T: Send>(fake: &FakeMic, stop: impl FnOnce() -> T + Send) -> T {
-    thread::scope(|scope| {
-        let stopping = scope.spawn(stop);
-        while !stopping.is_finished() {
-            fake.push(&[]);
-            thread::yield_now();
-        }
-        stopping.join().unwrap()
-    })
-}
-
-fn samples(sealed: Sealed) -> Vec<f32> {
-    sealed
-        .recording
-        .expect("the posted recording comes back")
-        .finish()
-        .samples
 }
 
 fn sink_panicked(sealed: &Sealed) -> bool {
