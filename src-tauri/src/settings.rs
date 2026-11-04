@@ -1,4 +1,3 @@
-use crate::openvino_cleaner::{OpenVinoDevice, OFFERED_MODELS, OPENVINO_PROVIDER_ID};
 use crate::utils;
 use log::{debug, warn};
 use serde::de::{self, Visitor};
@@ -11,6 +10,18 @@ use tauri_plugin_store::StoreExt;
 
 pub const APPLE_INTELLIGENCE_PROVIDER_ID: &str = "apple_intelligence";
 pub const APPLE_INTELLIGENCE_DEFAULT_MODEL_ID: &str = "Apple Intelligence";
+pub const OPENVINO_PROVIDER_ID: &str = "openvino";
+pub const OPENVINO_DEFAULT_MODEL_ID: &str = "qwen2.5-1.5b-instruct-int4-ov";
+
+/// Where the OpenVINO provider runs its cleanup model.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVinoDevice {
+    #[default]
+    Npu,
+    Gpu,
+    Cpu,
+}
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "lowercase")]
@@ -845,7 +856,7 @@ fn default_model_for_provider(provider_id: &str) -> String {
         return APPLE_INTELLIGENCE_DEFAULT_MODEL_ID.to_string();
     }
     if provider_id == OPENVINO_PROVIDER_ID {
-        return OFFERED_MODELS[0].id.to_string();
+        return OPENVINO_DEFAULT_MODEL_ID.to_string();
     }
     String::new()
 }
@@ -2052,6 +2063,22 @@ mod tests {
         let format_of = |id: &str| settings.post_process_provider(id).unwrap().api_format;
         assert_eq!(format_of("anthropic"), PostProcessApiFormat::Anthropic);
         assert_eq!(format_of("custom"), PostProcessApiFormat::Anthropic);
+    }
+
+    #[test]
+    fn openvino_device_defaults_to_npu_and_round_trips_lowercase() {
+        assert_eq!(OpenVinoDevice::default(), OpenVinoDevice::Npu);
+        for (device, json) in [
+            (OpenVinoDevice::Npu, "\"npu\""),
+            (OpenVinoDevice::Gpu, "\"gpu\""),
+            (OpenVinoDevice::Cpu, "\"cpu\""),
+        ] {
+            assert_eq!(serde_json::to_string(&device).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<OpenVinoDevice>(json).unwrap(),
+                device
+            );
+        }
     }
 
     #[test]

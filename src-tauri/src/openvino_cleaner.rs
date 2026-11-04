@@ -1,15 +1,15 @@
 use crate::managers::model::{hf_snapshot_dirs, ModelManager};
-use crate::settings::{self, AppSettings};
+use crate::settings::{
+    self, AppSettings, OpenVinoDevice, OPENVINO_DEFAULT_MODEL_ID, OPENVINO_PROVIDER_ID,
+};
 use log::{error, info, warn};
 use openvino_genai::{GenerationConfig, LlmPipeline};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use specta::Type;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, State};
-
-pub const OPENVINO_PROVIDER_ID: &str = "openvino";
 
 /// NPU static shapes, in tokens. Unmeasured proposals, not crate requirements.
 const MAX_PROMPT_LEN: usize = 1024;
@@ -18,22 +18,11 @@ const MIN_RESPONSE_LEN: usize = 512;
 /// the NPU's static prompt shape without running the tokenizer.
 const CHARS_PER_TOKEN: usize = 4;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, Type)]
-#[serde(rename_all = "lowercase")]
-pub enum OpenVinoDevice {
-    #[default]
-    Npu,
-    Gpu,
-    Cpu,
-}
-
-impl OpenVinoDevice {
-    fn ov_name(self) -> &'static str {
-        match self {
-            OpenVinoDevice::Npu => "NPU",
-            OpenVinoDevice::Gpu => "GPU",
-            OpenVinoDevice::Cpu => "CPU",
-        }
+fn device_name(device: OpenVinoDevice) -> &'static str {
+    match device {
+        OpenVinoDevice::Npu => "NPU",
+        OpenVinoDevice::Gpu => "GPU",
+        OpenVinoDevice::Cpu => "CPU",
     }
 }
 
@@ -46,7 +35,7 @@ pub struct OfferedModel {
 }
 
 pub const OFFERED_MODELS: &[OfferedModel] = &[OfferedModel {
-    id: "qwen2.5-1.5b-instruct-int4-ov",
+    id: OPENVINO_DEFAULT_MODEL_ID,
     label: "Qwen2.5 1.5B Instruct",
     repo: "OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov",
     revision: "4d14c299e35d8b74e3471f9e92bd1377fae50736",
@@ -200,16 +189,12 @@ fn load_pipeline((dir, device): &LoadKey, cache_dir: &Path) -> Result<LlmPipelin
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
-    info!("Loading {:?} on {}", dir.0, device.ov_name());
-    LlmPipeline::with_properties(&dir.0.to_string_lossy(), device.ov_name(), &properties).map_err(
-        |e| {
-            error!(
-                "OpenVINO could not load the model on {}: {e}",
-                device.ov_name()
-            );
-            CleanerError::DeviceFailed
-        },
-    )
+    let device = device_name(*device);
+    info!("Loading {} on {device}", dir.0.display());
+    LlmPipeline::with_properties(&dir.0.to_string_lossy(), device, &properties).map_err(|e| {
+        error!("OpenVINO could not load the model on {device}: {e}");
+        CleanerError::DeviceFailed
+    })
 }
 
 fn generate(pipeline: &mut LlmPipeline, prompt: &str) -> Result<String, CleanerError> {
@@ -343,22 +328,6 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.as_str())
-    }
-
-    #[test]
-    fn device_defaults_to_npu_and_round_trips_lowercase() {
-        assert_eq!(OpenVinoDevice::default(), OpenVinoDevice::Npu);
-        for (device, json) in [
-            (OpenVinoDevice::Npu, "\"npu\""),
-            (OpenVinoDevice::Gpu, "\"gpu\""),
-            (OpenVinoDevice::Cpu, "\"cpu\""),
-        ] {
-            assert_eq!(serde_json::to_string(&device).unwrap(), json);
-            assert_eq!(
-                serde_json::from_str::<OpenVinoDevice>(json).unwrap(),
-                device
-            );
-        }
     }
 
     #[test]

@@ -831,10 +831,7 @@ pub fn run(cli_args: CliArgs) {
             "APPLE_INTELLIGENCE_PROVIDER_ID",
             settings::APPLE_INTELLIGENCE_PROVIDER_ID,
         )
-        .constant(
-            "OPENVINO_PROVIDER_ID",
-            openvino_cleaner::OPENVINO_PROVIDER_ID,
-        )
+        .constant("OPENVINO_PROVIDER_ID", settings::OPENVINO_PROVIDER_ID)
         .events(collect_events![
             managers::history::HistoryUpdatePayload,
             managers::transcription_jobs::TranscriptionJob,

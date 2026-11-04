@@ -19,9 +19,10 @@ use specta::Type;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::openvino_cleaner::{OpenVinoCleaner, OFFERED_MODELS, OPENVINO_PROVIDER_ID};
+use crate::openvino_cleaner::{OpenVinoCleaner, OFFERED_MODELS};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
+use crate::settings::OPENVINO_PROVIDER_ID;
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ChineseScript, ClipboardHandling, KeyboardImplementation,
     LLMPrompt, LanguageDetectionMode, OverlayPosition, OverlayStyle, PasteMethod,
