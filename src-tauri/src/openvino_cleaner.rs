@@ -8,7 +8,7 @@ use serde::Serialize;
 use specta::Type;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tauri::{AppHandle, Emitter, State};
 
 /// NPU static shapes, in tokens. Unmeasured proposals, not crate requirements.
@@ -127,11 +127,7 @@ impl OpenVinoCleaner {
         let cache_dir = self.cache_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut slot = lock_slot(&slot);
-            let result = load_or_reuse(&mut slot, key, &cache_dir).and_then(work);
-            if matches!(result, Err(CleanerError::GenerateFailed)) {
-                *slot = Slot::Empty;
-            }
-            result
+            load_or_reuse(&mut slot, key, &cache_dir).and_then(work)
         })
         .await
         .unwrap_or_else(|e| {
@@ -142,12 +138,7 @@ impl OpenVinoCleaner {
 }
 
 fn lock_slot(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
-    slot.lock().unwrap_or_else(|poisoned| {
-        slot.clear_poison();
-        let mut guard = poisoned.into_inner();
-        *guard = Slot::Empty;
-        guard
-    })
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn resolve_key(settings: &AppSettings) -> Result<LoadKey, CleanerError> {
