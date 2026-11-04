@@ -239,10 +239,20 @@ fn generate(
         .set_max_new_tokens(MIN_RESPONSE_LEN)
         .map_err(generate_failed)?;
     let streamer = Streamer::new(move |_| streaming_status(&stopped));
-    let text = pipeline
+    let (text, generated_tokens) = pipeline
         .generate_with_history(&history, Some(&config), Some(&streamer))
-        .and_then(|results| results.get_string())
+        .and_then(|results| {
+            let generated_tokens = results.get_perf_metrics()?.get_num_generation_tokens()?;
+            Ok((results.get_string()?, generated_tokens))
+        })
         .map_err(generate_failed)?;
+    check_reply(text, generated_tokens)
+}
+
+fn check_reply(text: String, generated_tokens: usize) -> Result<String, CleanerError> {
+    if generated_tokens >= MIN_RESPONSE_LEN {
+        return Err(CleanerError::ReplyCutOff);
+    }
     if text.trim().is_empty() {
         return Err(CleanerError::EmptyOutput);
     }
@@ -284,6 +294,8 @@ pub enum CleanerError {
     Load(LoadError),
     GenerateFailed,
     EmptyOutput,
+    /// The reply used every token it was allowed, so its end is missing.
+    ReplyCutOff,
     PromptTooLong,
 }
 
@@ -299,6 +311,9 @@ impl fmt::Display for CleanerError {
             CleanerError::Load(error) => error.fmt(f),
             CleanerError::GenerateFailed => f.write_str("generation failed"),
             CleanerError::EmptyOutput => f.write_str("the model returned no text"),
+            CleanerError::ReplyCutOff => {
+                write!(f, "the reply reached the {MIN_RESPONSE_LEN}-token limit")
+            }
             CleanerError::PromptTooLong => f.write_str("the prompt is too long for the NPU"),
         }
     }
@@ -363,6 +378,19 @@ mod tests {
         let properties = load_properties(OpenVinoDevice::Cpu, "cache");
         assert_eq!(property(&properties, "CACHE_DIR"), Some("cache"));
         assert_eq!(property(&properties, "MAX_PROMPT_LEN"), None);
+    }
+
+    #[test]
+    fn a_reply_that_used_every_token_is_cut_off() {
+        assert_eq!(
+            check_reply("cleaned".into(), MIN_RESPONSE_LEN),
+            Err(CleanerError::ReplyCutOff)
+        );
+        assert_eq!(
+            check_reply("cleaned".into(), MIN_RESPONSE_LEN - 1),
+            Ok("cleaned".into())
+        );
+        assert_eq!(check_reply("  ".into(), 1), Err(CleanerError::EmptyOutput));
     }
 
     #[test]
