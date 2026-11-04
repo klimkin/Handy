@@ -244,9 +244,8 @@ pub enum RecordingState {
         /// The diagnostics run this take belongs to. Travels with the
         /// recording so `stop_recording` can stamp spans without a global.
         run: RunId,
-        /// The microphone the take was posted to. The take seals it on this
-        /// handle, so no lock is held across the recorder's stop, even if
-        /// the manager retired it meanwhile.
+        /// The microphone the take was posted to; the manager may have
+        /// retired it since.
         microphone: Arc<OpenMicrophone>,
     },
     Stopping,
@@ -463,11 +462,9 @@ fn open_microphone_on_channel(
     }
 }
 
-/// Whether an open microphone keeps listening between takes, holding the
-/// pre-roll for the next press. Never in AirPods mode: a listening recorder
-/// holds the headset, pinning it in its call profile. `current`: still the
-/// manager's microphone, not one retired mid-take.
-fn rearm_after_take(mode: MicrophoneMode, airpods: bool, failed: bool, current: bool) -> bool {
+/// Never in AirPods mode: a listening recorder holds the headset, pinning it
+/// in its call profile.
+fn listens_between_takes(mode: MicrophoneMode, airpods: bool, failed: bool, current: bool) -> bool {
     mode == MicrophoneMode::AlwaysOn && !airpods && !failed && current
 }
 
@@ -776,8 +773,6 @@ impl AudioRecordingManager {
         *self.vad.lock().unwrap() = VadSlot::Idle(vad);
     }
 
-    /// Takes back the detector a recording borrowed. A recording lost with
-    /// its sink took the detector with it, so the next one loads afresh.
     fn reclaim_vad(&self, recording: Option<CaptureSink>) {
         match recording {
             Some(recording) => self.return_vad(recording.into_vad()),
@@ -958,8 +953,6 @@ impl AudioRecordingManager {
             mute_guard.did_mute = false;
         }
 
-        // Closed outside the slot lock. A take in progress keeps its own
-        // handle, so its device closes when the take ends.
         let retired = self.recorder.lock().unwrap().take();
         drop(retired);
 
@@ -967,7 +960,6 @@ impl AudioRecordingManager {
         debug!("Microphone stream stopped");
     }
 
-    /// Arms `microphone` for the next press if [`rearm_after_take`] allows.
     fn keep_listening(&self, microphone: &Arc<OpenMicrophone>) {
         let current = self
             .recorder
@@ -977,15 +969,13 @@ impl AudioRecordingManager {
             .is_some_and(|open| Arc::ptr_eq(open, microphone));
         let mode = *self.mode.lock().unwrap();
         let airpods = self.airpods_mode.load(Ordering::Acquire);
-        if rearm_after_take(mode, airpods, microphone.needs_reopen(), current) {
+        if listens_between_takes(mode, airpods, microphone.needs_reopen(), current) {
             if let Err(error) = microphone.arm() {
                 warn!("Microphone failed between recordings ({error}); the next one reopens it");
             }
         }
     }
 
-    /// Converges the stream once a take has ended: closed, closing lazily,
-    /// or listening for the next press.
     fn settle_idle_stream(&self, microphone: &Arc<OpenMicrophone>) {
         let mode = *self.mode.lock().unwrap();
         match mode {
@@ -997,13 +987,10 @@ impl AudioRecordingManager {
         }
     }
 
-    /// Collects a sealed take's audio, taking back the detector it borrowed.
     fn collect(&self, sealed: Sealed) -> CollectedAudio {
         let (end, recording) = match (sealed.end, sealed.recording) {
             (Ok(end), Some(recording)) => (end, recording),
             (end, recording) => {
-                // The sink and the audio it held are lost; a recording it
-                // never picked up still hands back its detector.
                 if let Err(e) = end {
                     error!("Failed to stop recording: {e}");
                 }
@@ -1044,11 +1031,16 @@ impl AudioRecordingManager {
         }
     }
 
+    fn finish_take(&self, microphone: &Arc<OpenMicrophone>) -> CollectedAudio {
+        let collected = self.collect(microphone.seal());
+        self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
+        self.settle_idle_stream(microphone);
+        collected
+    }
+
     /* ---------- mode switching --------------------------------------------- */
 
     pub fn update_mode(&self, new_mode: MicrophoneMode) -> Result<(), anyhow::Error> {
-        // Serialized against a press. A take in progress settles the stream
-        // for the new mode when it ends.
         let state = self.state.lock().unwrap();
         let previous = std::mem::replace(&mut *self.mode.lock().unwrap(), new_mode);
 
@@ -1142,8 +1134,6 @@ impl AudioRecordingManager {
                 ready_tx,
                 run,
             );
-            // Refused if the stream was opened for another detector's frame
-            // size; a fresh stream takes this one's.
             if let Err(refused) = microphone.post(recording) {
                 self.return_vad(refused.into_recording().into_vad());
                 if reopened {
@@ -1177,8 +1167,6 @@ impl AudioRecordingManager {
                     if reopened {
                         return Err(anyhow::Error::new(error).context("Failed to start recorder"));
                     }
-                    // The failure is the microphone's now, so the next pass
-                    // reopens it.
                     warn!("Microphone failed before this recording ({error}); reopening");
                     reopened = true;
                 }
@@ -1233,7 +1221,6 @@ impl AudioRecordingManager {
     /// Moves a warm stream to the newly selected device. A take in progress
     /// keeps the old device until it ends; the next press opens the new one.
     pub fn update_selected_device(&self) -> Result<(), anyhow::Error> {
-        // Serialized against a press, so no take starts on the old device.
         let state = self.state.lock().unwrap();
         self.invalidate_device_cache();
         let was_open = *self.is_open.lock().unwrap();
@@ -1382,11 +1369,7 @@ impl AudioRecordingManager {
                     }
                 }
 
-                // Stopping keeps a new press from posting to this stream
-                // while it seals, so no lock needs holding across it.
-                let collected = self.collect(microphone.seal());
-                self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
-                self.settle_idle_stream(&microphone);
+                let collected = self.finish_take(&microphone);
 
                 if self.was_cancelled_since(cancel_generation) {
                     debug!("Recording stop cancelled; discarding captured samples");
@@ -1447,14 +1430,10 @@ impl AudioRecordingManager {
                 ..
             } => {
                 let microphone = Arc::clone(microphone);
-                // Stopping, not Idle, until sealed: a new press must not post
-                // to the stream being sealed.
                 self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
 
-                let _ = self.collect(microphone.seal());
-                self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
-                self.settle_idle_stream(&microphone);
+                self.finish_take(&microphone);
 
                 // The take is discarded, so its spans end here with a cancel
                 // code rather than waiting incomplete at capture stop.
@@ -1536,7 +1515,7 @@ mod tests {
             for airpods in [false, true] {
                 for failed in [false, true] {
                     for current in [false, true] {
-                        if rearm_after_take(mode, airpods, failed, current) {
+                        if listens_between_takes(mode, airpods, failed, current) {
                             listening.push((mode, airpods, failed, current));
                         }
                     }

@@ -11,15 +11,15 @@ use super::CaptureSink;
 pub struct OpenMicrophone {
     recorder: Recorder<MicSink>,
     inbox: Inbox,
-    /// The first failure, from the recorder's failure handler or a start or
-    /// stop. Its own, so a handler that runs late can't mark a replacement
-    /// failed.
+    /// Per microphone, so a failure handler that runs late can't mark a
+    /// replacement failed.
     failure: Arc<OnceLock<Error>>,
 }
 
 /// What [`OpenMicrophone::seal`] hands back.
 pub struct Sealed {
-    /// The posted recording, with the final chunk; `None` if none was posted.
+    /// The posted recording, with the final chunk; `None` if none was posted
+    /// or a failed stop lost it with the sink.
     pub recording: Option<CaptureSink>,
     pub end: Result<StreamEnd, Error>,
 }
@@ -42,8 +42,7 @@ impl OpenMicrophone {
         open: impl FnOnce(Box<dyn FnOnce(Error) + Send>) -> Result<Recorder<MicSink>, Error>,
     ) -> Result<Self, Error> {
         let failure = Arc::new(OnceLock::new());
-        // handy-recorder logs the failure. The stream is rebuilt on the next
-        // press; a recording in progress keeps the audio captured before it.
+        // handy-recorder logs the failure.
         let recorder = open(Box::new({
             let failure = Arc::clone(&failure);
             move |error| {
@@ -71,8 +70,8 @@ impl OpenMicrophone {
         self.inbox.post(recording)
     }
 
-    /// Starts the stream unless it is armed. Fails if the recorder has failed,
-    /// armed or not.
+    /// Starts the stream unless it is armed. Errs if the recorder has failed,
+    /// armed or not, and every error leaves `needs_reopen` true.
     pub fn arm(&self) -> Result<(), Error> {
         match self.recorder.start(MicSink::new(self.inbox.clone())) {
             Err(StartError { error, .. }) if error.kind() != ErrorKind::AlreadyRecording => {
@@ -106,7 +105,6 @@ impl OpenMicrophone {
                 if error.kind() != ErrorKind::NotRecording {
                     self.fail(&error);
                 }
-                // The sink is lost; a recording it never picked up is not.
                 Sealed {
                     recording: self.inbox.reclaim(),
                     end: Err(error),

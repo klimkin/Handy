@@ -5,14 +5,11 @@ use std::time::{Duration, Instant};
 use handy_recorder::{AudioChunk, Sink};
 
 use super::CaptureSink;
+use crate::audio_toolkit::constants;
 
-/// Pre-roll budget: 96 ms at 16 kHz.
-const HISTORY_FRAMES: usize = 1536;
-/// Audio older than this at the press is not replayed, e.g. after the stream
-/// stalled.
+pub(super) const HISTORY_FRAMES: usize = 96 * constants::WHISPER_SAMPLE_RATE as usize / 1_000;
 const MAX_PREROLL_AGE: Duration = Duration::from_millis(100);
 
-/// A chunk kept for replay.
 struct Packet {
     received: Instant,
     valid_frames: usize,
@@ -32,7 +29,6 @@ impl Packet {
     }
 }
 
-/// The latest chunks, oldest first, within the pre-roll budget (at least one).
 struct History {
     packets: VecDeque<Packet>,
     capacity: usize,
@@ -51,7 +47,6 @@ impl History {
         let mut samples = if self.packets.len() < self.capacity {
             Vec::with_capacity(chunk.samples.len())
         } else {
-            // Reuse the oldest buffer, so an armed stream stops allocating.
             let mut oldest = self
                 .packets
                 .pop_front()
@@ -70,7 +65,6 @@ impl History {
         });
     }
 
-    /// Chunks received at most [`MAX_PREROLL_AGE`] before `pressed`.
     fn recent(&self, pressed: Instant) -> impl Iterator<Item = &Packet> {
         self.packets.iter().filter(move |packet| {
             pressed.saturating_duration_since(packet.received) <= MAX_PREROLL_AGE
@@ -78,7 +72,6 @@ impl History {
     }
 }
 
-/// A recording posted at `at`, waiting for the sink's next chunk.
 struct Posted {
     recording: CaptureSink,
     at: Instant,
@@ -109,7 +102,6 @@ impl Refused {
 }
 
 impl Inbox {
-    /// An inbox for a microphone delivering `frames_per_chunk`-frame chunks.
     pub fn new(frames_per_chunk: usize) -> Self {
         Self {
             pending: Arc::default(),
@@ -134,8 +126,6 @@ impl Inbox {
         Ok(())
     }
 
-    /// The posted recording, unless the manager is posting right now; the
-    /// next chunk tries again, and history keeps the audio in between.
     fn try_take(&self) -> Option<Posted> {
         self.pending.try_lock().ok()?.take()
     }

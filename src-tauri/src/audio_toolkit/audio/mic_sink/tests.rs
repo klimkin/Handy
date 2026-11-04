@@ -5,8 +5,6 @@ use handy_recorder::AudioChunk;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A scripted armed stream in real time. Stream sample `i` has the value `i`,
-/// counting from 1, so a zero in a recording can only be padding.
 struct Stream {
     sink: MicSink,
     inbox: Inbox,
@@ -60,7 +58,6 @@ impl Stream {
         self.sink.process_at(chunk, self.start + self.elapsed);
     }
 
-    /// Posts at the current stream time, as a press would.
     fn post(&self, recording: CaptureSink) {
         assert!(
             self.inbox
@@ -86,8 +83,10 @@ fn a_recording_starts_with_the_audio_just_before_its_press() {
     stream.chunks(1);
 
     assert!(ready.try_recv().is_ok(), "ready once audio reaches it");
-    // The three chunks before the press, oldest first, then live audio.
-    assert_eq!(stream.take().finish().samples, ramp(2 * 512 + 1, 6 * 512));
+    assert_eq!(
+        stream.take().finish().samples,
+        ramp(5 * 512 - HISTORY_FRAMES + 1, 6 * 512)
+    );
 }
 
 #[test]
@@ -117,7 +116,6 @@ fn history_older_than_100_ms_at_the_press_is_not_replayed() {
 
     stream.chunks(1);
 
-    // Of the three chunks kept, only the one after the stall is recent.
     assert_eq!(stream.take().finish().samples, ramp(3 * 512 + 1, 5 * 512));
 }
 
@@ -126,11 +124,9 @@ fn a_late_pickup_still_gets_the_audio_before_the_press() {
     let mut stream = Stream::new(512);
     stream.chunks(3);
     stream.post(recording(512).0);
-    // The pickup comes late, as after a stalled callback.
     stream.stall(Duration::from_millis(80));
     stream.chunks(1);
 
-    // Aged from the press, the pre-press chunks are still recent.
     assert_eq!(stream.take().finish().samples, ramp(1, 4 * 512));
 }
 

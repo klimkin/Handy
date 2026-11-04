@@ -4,7 +4,6 @@ use super::{AudioFrameCallback, CaptureSink, CaptureVad, VadPolicy};
 use crate::audio_toolkit::vad::{VadFrame, VoiceActivityDetector};
 use crate::diagnostics;
 
-/// Keeps every frame, and checks each is exactly one frame long.
 struct FrameSized(usize);
 
 impl VoiceActivityDetector for FrameSized {
@@ -18,8 +17,6 @@ impl VoiceActivityDetector for FrameSized {
     }
 }
 
-/// A recording with a `frames`-sample detector that keeps everything, and
-/// its readiness receiver.
 pub(super) fn recording(frames: usize) -> (CaptureSink, mpsc::Receiver<()>) {
     recording_with(frames, VadPolicy::Disabled, Arc::new(|_| {}))
 }
@@ -41,7 +38,6 @@ pub(super) fn recording_with(
     (recording, ready)
 }
 
-/// Stream samples `first..=last`: the test streams number their samples from 1.
 pub(super) fn ramp(first: usize, last: usize) -> Vec<f32> {
     (first..=last).map(|i| i as f32).collect()
 }

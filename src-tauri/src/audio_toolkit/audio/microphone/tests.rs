@@ -7,10 +7,12 @@ use handy_recorder::testing::{FakeError, FakeMic};
 use handy_recorder::{EndReason, Recorder, RecorderConfig};
 
 use super::{OpenMicrophone, Sealed};
+use crate::audio_toolkit::audio::mic_sink::HISTORY_FRAMES;
 use crate::audio_toolkit::audio::test_support::{ramp, recording, recording_with};
 use crate::audio_toolkit::audio::{CaptureSink, VadPolicy};
 
 const FRAMES: usize = 512;
+const BLOCK_FRAMES: usize = 160;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time for the recorder's delivery thread to apply a start, or to file the
 /// audio pushed so far: a block pushed before the start applies is discarded.
@@ -37,13 +39,11 @@ fn post(mic: &OpenMicrophone, recording: CaptureSink) {
     assert!(mic.post(recording).is_ok(), "post refused");
 }
 
-/// Plays stream frames `first..first + frames` in 10 ms blocks, frame `i`
-/// carrying the value `i` on every channel.
 fn play(fake: &FakeMic, channels: u16, first: usize, frames: usize) {
     let samples: Vec<f32> = (first..first + frames)
         .flat_map(|i| std::iter::repeat_n(i as f32, channels.into()))
         .collect();
-    for block in samples.chunks(160 * usize::from(channels)) {
+    for block in samples.chunks(BLOCK_FRAMES * usize::from(channels)) {
         assert!(fake.push(block), "the device is streaming");
     }
 }
@@ -85,7 +85,6 @@ fn panicking_recording() -> CaptureSink {
     .0
 }
 
-/// Base's ordinary take: a recorder whose sink is the recording.
 fn ordinary_take(rate: u32, channels: u16, first: usize, frames: usize) -> Vec<f32> {
     let fake = FakeMic::new(rate, channels);
     let recorder: Recorder<CaptureSink> = fake.open(config(), None, OPEN_TIMEOUT).unwrap();
@@ -111,7 +110,6 @@ fn a_take_ends_exactly_like_an_ordinary_recording() {
 
         let take = samples(while_running(&fake, || mic.seal()));
 
-        // The final chunk is padded to a whole detector frame.
         assert_eq!(take.len() % FRAMES, 0);
         assert_eq!(
             take,
@@ -137,7 +135,11 @@ fn an_always_on_take_ends_exactly_like_an_ordinary_recording() {
     let take = samples(while_running(&fake, || mic.seal()));
 
     let ordinary = ordinary_take(16_000, 1, 4 * FRAMES + 1, 4_000);
-    assert_eq!(take.len(), ordinary.len() + 3 * FRAMES, "96 ms replayed");
+    assert_eq!(
+        take.len(),
+        ordinary.len() + HISTORY_FRAMES,
+        "96 ms replayed"
+    );
     assert!(take.ends_with(&ordinary));
 }
 
@@ -146,16 +148,21 @@ fn a_take_starts_with_96_ms_before_the_press() {
     let fake = FakeMic::new(16_000, 1);
     let mic = open(&fake);
     arm(&mic);
-    play(&fake, 1, 1, 3_200);
+    let before = 3_200;
+    play(&fake, 1, 1, before);
     thread::sleep(SETTLE);
     post(&mic, recording(FRAMES).0);
-    play(&fake, 1, 3_201, 160);
+    play(&fake, 1, before + 1, BLOCK_FRAMES);
 
     let take = samples(while_running(&fake, || mic.seal()));
 
-    // The press came after six whole chunks: the last three are replayed,
-    // then the rest, flushed at the seal.
-    assert_eq!(take, ramp(3_072 - 1_536 + 1, 3_360));
+    assert_eq!(
+        take,
+        ramp(
+            before / FRAMES * FRAMES - HISTORY_FRAMES + 1,
+            before + BLOCK_FRAMES
+        )
+    );
 }
 
 #[test]
@@ -168,8 +175,8 @@ fn quick_takes_share_no_audio() {
         scope.spawn(|| {
             let mut next = 1;
             while playing.load(Ordering::Relaxed) {
-                play(&fake, 1, next, 160);
-                next += 160;
+                play(&fake, 1, next, BLOCK_FRAMES);
+                next += BLOCK_FRAMES;
                 thread::sleep(Duration::from_millis(10));
             }
         });
