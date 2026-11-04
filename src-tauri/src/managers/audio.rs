@@ -1228,14 +1228,19 @@ impl AudioRecordingManager {
         Ok(())
     }
 
+    /// Moves a warm stream to the newly selected device. A take in progress
+    /// keeps the old device until it ends; the next press opens the new one.
     pub fn update_selected_device(&self) -> Result<(), anyhow::Error> {
-        // Device settings changed; re-enumerate the device and restart capture.
+        // Serialized against a press, so no take starts on the old device.
+        let state = self.state.lock().unwrap();
         self.invalidate_device_cache();
         let was_open = *self.is_open.lock().unwrap();
         if was_open {
             self.close_generation.fetch_add(1, Ordering::SeqCst);
             self.stop_microphone_stream();
-            self.start_microphone_stream()?;
+            if matches!(*state, RecordingState::Idle) {
+                self.start_microphone_stream()?;
+            }
         }
         Ok(())
     }
