@@ -146,6 +146,11 @@ impl CaptureSink {
         self.vad
     }
 
+    /// Samples per detector frame: the chunk size this sink expects.
+    pub fn frame_samples(&self) -> usize {
+        self.vad.frame_samples()
+    }
+
     /// Hands back the recording and the detector. Logs what VAD still held
     /// back when the recording stopped.
     pub fn finish(self) -> CapturedAudio {

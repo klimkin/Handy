@@ -1,5 +1,5 @@
 use crate::audio_toolkit::{
-    audio::{AudioFrameCallback, LevelCallback},
+    audio::{AudioFrameCallback, LevelCallback, OpenMicrophone, Sealed},
     vad::{
         frames_for_duration_ms, EarshotVad, SmoothedVad, VAD_OFFLINE_HANGOVER_MS, VAD_ONSET_MS,
         VAD_PREFILL_MS, VAD_STREAMING_HANGOVER_MS,
@@ -12,7 +12,7 @@ use crate::managers::transcription::StreamRouter;
 use crate::notices::NoticeCode;
 use crate::settings::{get_settings, write_settings, AppSettings, VadBackend};
 use crate::utils;
-use handy_recorder::{Channels, EndReason, ErrorKind, Recorder, RecorderConfig, StartError};
+use handy_recorder::{Channels, EndReason, ErrorKind, RecorderConfig};
 use log::{debug, error, info, trace, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -237,7 +237,6 @@ const WHISPER_SAMPLE_RATE: usize = 16000;
 
 /* ──────────────────────────────────────────────────────────────── */
 
-#[derive(Clone, Debug)]
 pub enum RecordingState {
     Idle,
     Recording {
@@ -245,11 +244,15 @@ pub enum RecordingState {
         /// The diagnostics run this take belongs to. Travels with the
         /// recording so `stop_recording` can stamp spans without a global.
         run: RunId,
+        /// The microphone the take was posted to. The take seals it on this
+        /// handle, so no lock is held across the recorder's stop, even if
+        /// the manager retired it meanwhile.
+        microphone: Arc<OpenMicrophone>,
     },
     Stopping,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MicrophoneMode {
     AlwaysOn,
     OnDemand,
@@ -295,20 +298,6 @@ enum VadSlot {
     Lent {
         frame_samples: usize,
     },
-}
-
-/// An open microphone: the stream is running whether or not it is recording.
-struct OpenMicrophone {
-    recorder: Recorder<CaptureSink>,
-    /// Set when this recorder fails. Its own flag, so a failure handler that
-    /// runs late can't mark a replacement recorder failed.
-    failed: Arc<AtomicBool>,
-}
-
-impl OpenMicrophone {
-    fn needs_reopen(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
-    }
 }
 
 /// What a finished recording hands back: the samples that passed the VAD
@@ -445,17 +434,6 @@ fn microphone_config(
     }
 }
 
-fn open_microphone(config: RecorderConfig) -> Result<OpenMicrophone, handy_recorder::Error> {
-    let failed = Arc::new(AtomicBool::new(false));
-    let recorder = Recorder::open_with_failure_handler(config, {
-        let failed = Arc::clone(&failed);
-        // handy-recorder logs the failure. The stream is rebuilt on the next
-        // start; a recording in progress keeps the audio captured before it.
-        move |_| failed.store(true, Ordering::Release)
-    })?;
-    Ok(OpenMicrophone { recorder, failed })
-}
-
 /// Opens with the selected channel, or averages all channels if the device
 /// doesn't have it (a different microphone than the one it was chosen on).
 fn open_microphone_on_channel(
@@ -464,7 +442,7 @@ fn open_microphone_on_channel(
     take_headset: bool,
     frames_per_chunk: usize,
 ) -> Result<OpenMicrophone, handy_recorder::Error> {
-    match open_microphone(microphone_config(
+    match OpenMicrophone::open(microphone_config(
         device.clone(),
         channel,
         take_headset,
@@ -472,7 +450,7 @@ fn open_microphone_on_channel(
     )) {
         Err(error) if error.kind() == ErrorKind::InvalidChannel => {
             warn!("{error}; averaging all input channels instead");
-            open_microphone(microphone_config(
+            OpenMicrophone::open(microphone_config(
                 device,
                 None,
                 take_headset,
@@ -481,6 +459,14 @@ fn open_microphone_on_channel(
         }
         result => result,
     }
+}
+
+/// Whether an open microphone keeps listening between takes, holding the
+/// pre-roll for the next press. Never in AirPods mode: a listening recorder
+/// holds the headset, pinning it in its call profile. `current`: still the
+/// manager's microphone, not one retired mid-take.
+fn rearm_after_take(mode: MicrophoneMode, airpods: bool, failed: bool, current: bool) -> bool {
+    mode == MicrophoneMode::AlwaysOn && !airpods && !failed && current
 }
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -510,7 +496,7 @@ pub struct AudioRecordingManager {
     mode: Arc<Mutex<MicrophoneMode>>,
     app_handle: tauri::AppHandle,
 
-    recorder: Arc<Mutex<Option<OpenMicrophone>>>,
+    recorder: Arc<Mutex<Option<Arc<OpenMicrophone>>>>,
     vad: Arc<Mutex<VadSlot>>,
     /// Zero-based input channel to record, or `None` to average them all.
     /// Held here rather than read from settings, which are persisted only
@@ -525,7 +511,6 @@ pub struct AudioRecordingManager {
     /// (captured directly, not via Tauri state — see its docs).
     on_audio: AudioFrameCallback,
     is_open: Arc<Mutex<bool>>,
-    is_recording: Arc<Mutex<bool>>,
     mute_state: Arc<Mutex<MuteState>>,
     close_generation: Arc<AtomicU64>,
     cancel_generation: Arc<AtomicU64>,
@@ -572,7 +557,7 @@ impl AudioRecordingManager {
 
         let manager = Self {
             state: Arc::new(Mutex::new(RecordingState::Idle)),
-            mode: Arc::new(Mutex::new(mode.clone())),
+            mode: Arc::new(Mutex::new(mode)),
             app_handle: app.clone(),
 
             recorder: Arc::new(Mutex::new(None)),
@@ -582,7 +567,6 @@ impl AudioRecordingManager {
             on_levels,
             on_audio,
             is_open: Arc::new(Mutex::new(false)),
-            is_recording: Arc::new(Mutex::new(false)),
             mute_state: Arc::new(Mutex::new(MuteState::default())),
             close_generation: Arc::new(AtomicU64::new(0)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
@@ -790,6 +774,15 @@ impl AudioRecordingManager {
         *self.vad.lock().unwrap() = VadSlot::Idle(vad);
     }
 
+    /// Takes back the detector a recording borrowed. A recording lost with
+    /// its sink took the detector with it, so the next one loads afresh.
+    fn reclaim_vad(&self, recording: Option<CaptureSink>) {
+        match recording {
+            Some(recording) => self.return_vad(recording.into_vad()),
+            None => *self.vad.lock().unwrap() = VadSlot::Unloaded,
+        }
+    }
+
     /* ---------- microphone life-cycle -------------------------------------- */
 
     /// Applies mute if mute_while_recording is enabled and stream is open.
@@ -832,26 +825,23 @@ impl AudioRecordingManager {
         }
     }
 
-    pub fn start_microphone_stream(&self) -> Result<(), anyhow::Error> {
+    /// Opens the microphone unless it is open and healthy, and keeps it
+    /// listening if the mode asks for that.
+    pub fn start_microphone_stream(&self) -> Result<Arc<OpenMicrophone>, anyhow::Error> {
         let mut open_flag = self.is_open.lock().unwrap();
         if *open_flag {
             // `is_open` only records that we opened a stream, not that it is
             // still running. If the recorder has since failed (mic unplugged,
             // stalled, permission revoked), rebuild it before the next
             // recording instead of handing the caller a failed recorder.
-            let needs_reopen = self
-                .recorder
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_none_or(OpenMicrophone::needs_reopen);
-
-            if !needs_reopen {
+            let open = self.recorder.lock().unwrap().clone();
+            if let Some(microphone) = open.filter(|microphone| !microphone.needs_reopen()) {
                 // trace, not debug: with the aliveness check in
                 // try_start_recording this now fires on every keypress in
                 // always-on mode.
                 trace!("Microphone stream already active");
-                return Ok(());
+                self.keep_listening(&microphone);
+                return Ok(microphone);
             }
 
             warn!("Microphone stream failed; reopening");
@@ -866,9 +856,7 @@ impl AudioRecordingManager {
                 }
             }
             let failed = self.recorder.lock().unwrap().take();
-            if let Some(microphone) = failed {
-                self.close_microphone(microphone);
-            }
+            drop(failed);
             *open_flag = false;
             self.invalidate_device_cache();
             // Fall through to the same fresh resolution and fallback path used
@@ -907,7 +895,7 @@ impl AudioRecordingManager {
         let channel = *self.selected_channel.lock().unwrap();
         let take_headset = self.airpods_mode.load(Ordering::Acquire);
         let open_started = Instant::now();
-        let microphone = match open_microphone_on_channel(
+        let microphone = Arc::new(match open_microphone_on_channel(
             resolution.device.clone(),
             channel,
             take_headset,
@@ -928,14 +916,14 @@ impl AudioRecordingManager {
                 )
             }
             result => result,
-        }?;
+        }?);
         debug!(
             "mic stream breakdown: device_resolve={:?} vad_ensure={:?} open={:?}",
             resolve_elapsed,
             vad_elapsed,
             open_started.elapsed()
         );
-        *self.recorder.lock().unwrap() = Some(microphone);
+        *self.recorder.lock().unwrap() = Some(Arc::clone(&microphone));
 
         *open_flag = true;
         if let Some(unavailable_name) = resolution.unavailable_selected_microphone {
@@ -950,7 +938,8 @@ impl AudioRecordingManager {
             "Microphone stream initialized in {:?}",
             start_time.elapsed()
         );
-        Ok(())
+        self.keep_listening(&microphone);
+        Ok(microphone)
     }
 
     pub fn stop_microphone_stream(&self) {
@@ -967,98 +956,116 @@ impl AudioRecordingManager {
             mute_guard.did_mute = false;
         }
 
-        let microphone = self.recorder.lock().unwrap().take();
-        if let Some(microphone) = microphone {
-            self.close_microphone(microphone);
-        }
+        // Closed outside the slot lock. A take in progress keeps its own
+        // handle, so its device closes when the take ends.
+        let retired = self.recorder.lock().unwrap().take();
+        drop(retired);
 
         *open_flag = false;
         debug!("Microphone stream stopped");
     }
 
-    /// Closes a microphone, first discarding any recording on it (its
-    /// detector comes back).
-    fn close_microphone(&self, microphone: OpenMicrophone) {
-        let mut is_recording = self.is_recording.lock().unwrap();
-        if *is_recording {
-            let _ = self.collect_recording(&microphone);
-            *is_recording = false;
-        }
-        if let Err(e) = microphone.recorder.close() {
-            warn!("Closing the microphone failed: {e}");
+    /// Arms `microphone` for the next press if [`rearm_after_take`] allows.
+    fn keep_listening(&self, microphone: &Arc<OpenMicrophone>) {
+        let current = self
+            .recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|open| Arc::ptr_eq(open, microphone));
+        let mode = *self.mode.lock().unwrap();
+        let airpods = self.airpods_mode.load(Ordering::Acquire);
+        if rearm_after_take(mode, airpods, microphone.needs_reopen(), current) {
+            if let Err(error) = microphone.arm() {
+                warn!("Microphone failed between recordings ({error}); the next one reopens it");
+            }
         }
     }
 
-    /// Stops the recording on `microphone`, returning its audio and taking
-    /// back the detector it borrowed.
-    fn collect_recording(&self, microphone: &OpenMicrophone) -> CollectedAudio {
-        match microphone.recorder.stop() {
-            Ok(stopped) => {
-                let failure = match &stopped.end_reason {
-                    EndReason::StopCalled => None,
-                    EndReason::RecorderFailed(error) => {
-                        microphone.failed.store(true, Ordering::Release);
-                        warn!("Recording cut short by a microphone failure; keeping the audio before it: {error}");
-                        Some(Code::RecorderFailed)
-                    }
-                    EndReason::SinkPanicked(message) => {
-                        error!("Recording cut short; audio processing panicked: {message}");
-                        Some(Code::SinkPanicked)
-                    }
-                };
-                if stopped.dropped_frames > 0 {
-                    warn!(
-                        "Recording completed after dropping {} microphone frames",
-                        stopped.dropped_frames
-                    );
-                }
-                let captured = stopped.sink.finish();
-                self.return_vad(captured.vad);
-                self.last_input_silent
-                    .store(captured.input_silent, Ordering::Release);
-                CollectedAudio {
-                    samples: captured.samples,
-                    dropped_frames: stopped.dropped_frames,
-                    failure,
-                }
+    /// Converges the stream once a take has ended: closed, closing lazily,
+    /// or listening for the next press.
+    fn settle_idle_stream(&self, microphone: &Arc<OpenMicrophone>) {
+        let mode = *self.mode.lock().unwrap();
+        match mode {
+            MicrophoneMode::OnDemand if get_settings(&self.app_handle).lazy_stream_close => {
+                self.schedule_lazy_close()
             }
-            Err(e) => {
-                // The recording and its detector are lost with the sink.
-                error!("Failed to stop recording: {e}");
-                self.last_input_silent.store(false, Ordering::Release);
-                if e.kind() != ErrorKind::NotRecording {
-                    microphone.failed.store(true, Ordering::Release);
+            MicrophoneMode::OnDemand => self.stop_microphone_stream(),
+            MicrophoneMode::AlwaysOn => self.keep_listening(microphone),
+        }
+    }
+
+    /// Collects a sealed take's audio, taking back the detector it borrowed.
+    fn collect(&self, sealed: Sealed) -> CollectedAudio {
+        let (end, recording) = match (sealed.end, sealed.recording) {
+            (Ok(end), Some(recording)) => (end, recording),
+            (end, recording) => {
+                // The sink and the audio it held are lost; a recording it
+                // never picked up still hands back its detector.
+                if let Err(e) = end {
+                    error!("Failed to stop recording: {e}");
                 }
-                *self.vad.lock().unwrap() = VadSlot::Unloaded;
-                CollectedAudio {
+                self.reclaim_vad(recording);
+                self.last_input_silent.store(false, Ordering::Release);
+                return CollectedAudio {
                     samples: Vec::new(),
                     dropped_frames: 0,
                     failure: None,
-                }
+                };
             }
+        };
+        let failure = match &end.reason {
+            EndReason::StopCalled => None,
+            EndReason::RecorderFailed(error) => {
+                warn!("Recording cut short by a microphone failure; keeping the audio before it: {error}");
+                Some(Code::RecorderFailed)
+            }
+            EndReason::SinkPanicked(message) => {
+                error!("Recording cut short; audio processing panicked: {message}");
+                Some(Code::SinkPanicked)
+            }
+        };
+        if end.dropped_frames > 0 {
+            warn!(
+                "Recording completed after dropping {} microphone frames",
+                end.dropped_frames
+            );
+        }
+        let captured = recording.finish();
+        self.return_vad(captured.vad);
+        self.last_input_silent
+            .store(captured.input_silent, Ordering::Release);
+        CollectedAudio {
+            samples: captured.samples,
+            dropped_frames: end.dropped_frames,
+            failure,
         }
     }
 
     /* ---------- mode switching --------------------------------------------- */
 
     pub fn update_mode(&self, new_mode: MicrophoneMode) -> Result<(), anyhow::Error> {
-        let cur_mode = self.mode.lock().unwrap().clone();
+        // Serialized against a press. A take in progress settles the stream
+        // for the new mode when it ends.
+        let state = self.state.lock().unwrap();
+        let previous = std::mem::replace(&mut *self.mode.lock().unwrap(), new_mode);
 
-        match (cur_mode, &new_mode) {
+        match (previous, new_mode) {
             (MicrophoneMode::AlwaysOn, MicrophoneMode::OnDemand) => {
-                if matches!(*self.state.lock().unwrap(), RecordingState::Idle) {
+                if matches!(*state, RecordingState::Idle) {
                     self.close_generation.fetch_add(1, Ordering::SeqCst);
                     self.stop_microphone_stream();
                 }
             }
             (MicrophoneMode::OnDemand, MicrophoneMode::AlwaysOn) => {
                 self.close_generation.fetch_add(1, Ordering::SeqCst);
-                self.start_microphone_stream()?;
+                if let Err(error) = self.start_microphone_stream() {
+                    *self.mode.lock().unwrap() = previous;
+                    return Err(error);
+                }
             }
             _ => {}
         }
-
-        *self.mode.lock().unwrap() = new_mode;
         Ok(())
     }
 
@@ -1118,13 +1125,16 @@ impl AudioRecordingManager {
             // is normally already open and this is a cheap aliveness check —
             // but if the recorder failed (device disconnect), it rebuilds the
             // stream instead of leaving every subsequent start wedged.
-            if let Err(e) = self.start_microphone_stream() {
-                error!("Failed to open microphone stream: {e}");
-                return Err(e);
-            }
+            let microphone = match self.start_microphone_stream() {
+                Ok(microphone) => microphone,
+                Err(e) => {
+                    error!("Failed to open microphone stream: {e}");
+                    return Err(e);
+                }
+            };
 
             let (ready_tx, receiver) = mpsc::channel();
-            let sink = CaptureSink::new(
+            let recording = CaptureSink::new(
                 self.lend_vad()?,
                 vad_policy,
                 Arc::clone(&self.on_levels),
@@ -1132,21 +1142,28 @@ impl AudioRecordingManager {
                 ready_tx,
                 run,
             );
+            // Refused if the stream was opened for another detector's frame
+            // size; a fresh stream takes this one's.
+            if let Err(refused) = microphone.post(recording) {
+                self.return_vad(refused.into_recording().into_vad());
+                if reopened {
+                    return Err(anyhow::anyhow!("The microphone refused the recording"));
+                }
+                warn!("The microphone refused the recording; reopening");
+                self.stop_microphone_stream();
+                reopened = true;
+                continue;
+            }
 
-            let recorder = self.recorder.lock().unwrap();
-            let Some(microphone) = recorder.as_ref() else {
-                self.return_vad(sink.into_vad());
-                return Err(anyhow::anyhow!("Recorder not available"));
-            };
-            match microphone.recorder.start(sink) {
+            match microphone.arm() {
                 Ok(()) => {
                     let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
-                    *self.is_recording.lock().unwrap() = true;
                     self.set_state(
                         &mut state,
                         RecordingState::Recording {
                             binding_id: binding_id.to_string(),
                             run,
+                            microphone,
                         },
                     );
                     debug!("Recording requested for binding {binding_id}");
@@ -1155,13 +1172,14 @@ impl AudioRecordingManager {
                         generation,
                     });
                 }
-                Err(StartError { error, sink }) => {
-                    self.return_vad(sink.into_vad());
-                    if reopened || error.kind() == ErrorKind::AlreadyRecording {
+                Err(error) => {
+                    self.reclaim_vad(microphone.seal().recording);
+                    if reopened {
                         return Err(anyhow::Error::new(error).context("Failed to start recorder"));
                     }
+                    // The failure is the microphone's now, so the next pass
+                    // reopens it.
                     warn!("Microphone failed before this recording ({error}); reopening");
-                    microphone.failed.store(true, Ordering::Release);
                     reopened = true;
                 }
             }
@@ -1313,6 +1331,7 @@ impl AudioRecordingManager {
             RecordingState::Recording {
                 binding_id: active,
                 run,
+                ..
             } if active == binding_id => Some(*run),
             _ => None,
         }
@@ -1330,7 +1349,9 @@ impl AudioRecordingManager {
             RecordingState::Recording {
                 binding_id: ref active,
                 run,
+                ref microphone,
             } if active == binding_id => {
+                let microphone = Arc::clone(microphone);
                 self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
 
@@ -1356,30 +1377,11 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let collected = match self.recorder.lock().unwrap().as_ref() {
-                    Some(microphone) => self.collect_recording(microphone),
-                    None => {
-                        error!("Recorder not available");
-                        self.last_input_silent.store(false, Ordering::Release);
-                        CollectedAudio {
-                            samples: Vec::new(),
-                            dropped_frames: 0,
-                            failure: None,
-                        }
-                    }
-                };
-
-                *self.is_recording.lock().unwrap() = false;
+                // Stopping keeps a new press from posting to this stream
+                // while it seals, so no lock needs holding across it.
+                let collected = self.collect(microphone.seal());
                 self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
-
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
+                self.settle_idle_stream(&microphone);
 
                 if self.was_cancelled_since(cancel_generation) {
                     debug!("Recording stop cancelled; discarding captured samples");
@@ -1434,24 +1436,20 @@ impl AudioRecordingManager {
         let mut state = self.state.lock().unwrap();
 
         match *state {
-            RecordingState::Recording { run, .. } => {
-                self.set_state(&mut state, RecordingState::Idle);
+            RecordingState::Recording {
+                run,
+                ref microphone,
+                ..
+            } => {
+                let microphone = Arc::clone(microphone);
+                // Stopping, not Idle, until sealed: a new press must not post
+                // to the stream being sealed.
+                self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
 
-                if let Some(microphone) = self.recorder.lock().unwrap().as_ref() {
-                    let _ = self.collect_recording(microphone); // Discard the result
-                }
-
-                *self.is_recording.lock().unwrap() = false;
-
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
+                let _ = self.collect(microphone.seal());
+                self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
+                self.settle_idle_stream(&microphone);
 
                 // The take is discarded, so its spans end here with a cancel
                 // code rather than waiting incomplete at capture stop.
@@ -1469,6 +1467,7 @@ impl AudioRecordingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use handy_recorder::Recorder;
 
     /// A recorder error, without touching a device: the request is rejected
     /// before one is opened.
@@ -1523,5 +1522,23 @@ mod tests {
     fn microphone_config_takes_the_headset_only_in_airpods_mode() {
         assert!(!microphone_config(None, None, false, 480).take_headset);
         assert!(microphone_config(None, None, true, 480).take_headset);
+    }
+
+    #[test]
+    fn only_a_healthy_current_always_on_microphone_keeps_listening() {
+        let mut listening = Vec::new();
+        for mode in [MicrophoneMode::AlwaysOn, MicrophoneMode::OnDemand] {
+            for airpods in [false, true] {
+                for failed in [false, true] {
+                    for current in [false, true] {
+                        if rearm_after_take(mode, airpods, failed, current) {
+                            listening.push((mode, airpods, failed, current));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(listening, [(MicrophoneMode::AlwaysOn, false, false, true)]);
     }
 }
