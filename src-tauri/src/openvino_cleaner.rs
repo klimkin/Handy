@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// NPU static shapes, in tokens. Unmeasured proposals, not crate requirements.
 const MAX_PROMPT_LEN: usize = 1024;
 const MIN_RESPONSE_LEN: usize = 512;
+/// Measured with the default prompt: without chunking the first token took
+/// about 3.3 s at any prompt length, with 256 it took about 0.95 s.
+const PREFILL_CHUNK_SIZE: usize = 256;
 /// Unmeasured stand-in for characters per token, used to keep a prompt inside
 /// the NPU's static prompt shape without running the tokenizer.
 const CHARS_PER_TOKEN: usize = 4;
@@ -338,6 +341,10 @@ fn load_properties(device: OpenVinoDevice, cache_dir: &str) -> Vec<(&'static str
     if device == OpenVinoDevice::Npu {
         properties.push(("MAX_PROMPT_LEN", MAX_PROMPT_LEN.to_string()));
         properties.push(("MIN_RESPONSE_LEN", MIN_RESPONSE_LEN.to_string()));
+        properties.push((
+            "NPUW_LLM_PREFILL_CHUNK_SIZE",
+            PREFILL_CHUNK_SIZE.to_string(),
+        ));
     }
     properties
 }
@@ -371,6 +378,10 @@ mod tests {
         assert_eq!(property(&properties, "CACHE_DIR"), Some("cache"));
         assert_eq!(property(&properties, "MAX_PROMPT_LEN"), Some("1024"));
         assert_eq!(property(&properties, "MIN_RESPONSE_LEN"), Some("512"));
+        assert_eq!(
+            property(&properties, "NPUW_LLM_PREFILL_CHUNK_SIZE"),
+            Some("256")
+        );
     }
 
     #[test]
