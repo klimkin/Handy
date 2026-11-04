@@ -1,4 +1,4 @@
-use crate::managers::model::hf_snapshot_dirs;
+use crate::managers::model::{hf_complete_snapshot, HfFile};
 use crate::settings::{
     AppSettings, OpenVinoDevice, OPENVINO_DEFAULT_MODEL_ID, OPENVINO_PROVIDER_ID,
 };
@@ -33,7 +33,11 @@ pub struct OfferedModel {
     pub label: &'static str,
     pub repo: &'static str,
     pub revision: &'static str,
-    pub files: &'static [&'static str],
+    pub files: &'static [HfFile],
+}
+
+const fn file(name: &'static str, size_bytes: u64) -> HfFile {
+    HfFile { name, size_bytes }
 }
 
 pub const OFFERED_MODELS: &[OfferedModel] = &[OfferedModel {
@@ -42,17 +46,17 @@ pub const OFFERED_MODELS: &[OfferedModel] = &[OfferedModel {
     repo: "OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov",
     revision: "4d14c299e35d8b74e3471f9e92bd1377fae50736",
     files: &[
-        "openvino_model.xml",
-        "openvino_model.bin",
-        "openvino_tokenizer.xml",
-        "openvino_tokenizer.bin",
-        "openvino_detokenizer.xml",
-        "openvino_detokenizer.bin",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "config.json",
-        "generation_config.json",
-        "special_tokens_map.json",
+        file("openvino_model.xml", 2_435_810),
+        file("openvino_model.bin", 909_864_660),
+        file("openvino_tokenizer.xml", 25_114),
+        file("openvino_tokenizer.bin", 5_588_628),
+        file("openvino_detokenizer.xml", 9_594),
+        file("openvino_detokenizer.bin", 2_189_639),
+        file("tokenizer.json", 11_421_896),
+        file("tokenizer_config.json", 7_336),
+        file("config.json", 772),
+        file("generation_config.json", 242),
+        file("special_tokens_map.json", 613),
     ],
 }];
 
@@ -66,10 +70,7 @@ struct ModelDir(PathBuf);
 
 impl ModelDir {
     fn find(model: &OfferedModel) -> Option<Self> {
-        hf_snapshot_dirs(model.repo, model.revision)
-            .into_iter()
-            .find(|dir| model.files.iter().all(|file| dir.join(file).is_file()))
-            .map(ModelDir)
+        hf_complete_snapshot(model.repo, model.revision, model.files).map(ModelDir)
     }
 }
 

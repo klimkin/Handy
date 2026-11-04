@@ -335,9 +335,49 @@ fn hf_cached_path(repo_id: &str, revision: &str, filename: &str) -> Option<PathB
     hf_cached_path_in(&hf_caches(), repo_id, revision, filename)
 }
 
-/// Every cached snapshot directory of `repo_id`, the `revision` pin first.
-pub(crate) fn hf_snapshot_dirs(repo_id: &str, revision: &str) -> Vec<PathBuf> {
-    hf_snapshot_paths(&hf_caches(), repo_id, revision)
+/// One file of a Hugging Face snapshot that isn't in the model catalog.
+pub struct HfFile {
+    pub name: &'static str,
+    pub size_bytes: u64,
+}
+
+/// The cached snapshot of `repo_id` that holds every one of `files`, the
+/// `revision` pin first.
+pub(crate) fn hf_complete_snapshot(
+    repo_id: &str,
+    revision: &str,
+    files: &[HfFile],
+) -> Option<PathBuf> {
+    hf_complete_snapshot_in(&hf_caches(), repo_id, revision, files)
+}
+
+fn hf_complete_snapshot_in(
+    caches: &[Cache],
+    repo_id: &str,
+    revision: &str,
+    files: &[HfFile],
+) -> Option<PathBuf> {
+    hf_snapshot_paths(caches, repo_id, revision)
+        .into_iter()
+        .find(|dir| files.iter().all(|file| dir.join(file.name).is_file()))
+}
+
+/// Where each of `files` reports, so together they fill one bar under `id`.
+fn snapshot_progress<'a>(id: &str, files: &[&'a HfFile]) -> Vec<(&'a HfFile, ProgressTarget)> {
+    let total = files.iter().map(|file| file.size_bytes).sum();
+    let mut offset = 0;
+    files
+        .iter()
+        .map(|&file| {
+            let target = ProgressTarget {
+                model_id: id.to_string(),
+                offset,
+                total: Some(total),
+            };
+            offset += file.size_bytes;
+            (file, target)
+        })
+        .collect()
 }
 
 /// Reuse an existing file regardless of which revision originally downloaded it.
@@ -1921,17 +1961,21 @@ impl ModelManager {
     }
 
     /// Fetch every file of a Hugging Face snapshot into the shared HF cache,
-    /// reporting and cancelling under `id`. Never writes into the models dir,
-    /// where a top-level `.bin` would be discovered as a transcription model.
-    /// `Ok(false)` if cancelled.
+    /// as one bar under `id`, which also cancels it. Never writes into the
+    /// models dir, where a top-level `.bin` would be discovered as a
+    /// transcription model. `Ok(false)` if cancelled.
     pub async fn download_hf_snapshot(
         &self,
         id: &str,
         label: &str,
         repo_id: &str,
         revision: &str,
-        files: &[&str],
+        files: &[HfFile],
     ) -> Result<bool> {
+        if hf_complete_snapshot(repo_id, revision, files).is_some() {
+            let _ = self.app_handle.emit("model-download-complete", id);
+            return Ok(true);
+        }
         let cancel_token = CancellationToken::new();
         self.cancel_flags
             .lock()
@@ -1942,18 +1986,19 @@ impl ModelManager {
             RepoType::Model,
             revision.to_string(),
         ));
+        let missing: Vec<&HfFile> = files
+            .iter()
+            .filter(|file| pinned.get(file.name).is_none())
+            .collect();
         let mut result = Ok(true);
-        for filename in files {
-            if pinned.get(filename).is_some() {
-                continue;
-            }
+        for (file, progress) in snapshot_progress(id, &missing) {
             let transfer = FileTransfer {
                 label,
                 repo_id,
                 revision,
-                filename,
+                filename: file.name,
                 mirrors: Vec::new(),
-                progress: ProgressTarget::own(id),
+                progress,
             };
             result = self.fetch_hf_file(&transfer, &cancel_token).await;
             if !matches!(result, Ok(true)) {
@@ -2686,6 +2731,54 @@ mod tests {
         };
         let p = model.progress(350, 700, Some(1.0));
         assert_eq!((p.downloaded, p.total), (395, 745));
+    }
+
+    #[test]
+    fn snapshot_files_report_as_one_bar() {
+        let small = HfFile {
+            name: "config.json",
+            size_bytes: 100,
+        };
+        let large = HfFile {
+            name: "model.bin",
+            size_bytes: 300,
+        };
+        let targets = snapshot_progress("m", &[&small, &large]);
+
+        let p = targets[0].1.progress(100, 100, None);
+        assert_eq!(
+            (p.model_id.as_str(), p.downloaded, p.total),
+            ("m", 100, 400)
+        );
+        let p = targets[1].1.progress(150, 300, None);
+        assert_eq!((p.downloaded, p.total), (250, 400));
+    }
+
+    #[test]
+    fn a_snapshot_counts_only_when_every_file_is_cached() {
+        let dir = TempDir::new().unwrap();
+        let caches = [Cache::new(dir.path().to_path_buf())];
+        let files = [
+            HfFile {
+                name: "a.xml",
+                size_bytes: 1,
+            },
+            HfFile {
+                name: "a.bin",
+                size_bytes: 1,
+            },
+        ];
+        add_cached_model(dir.path(), "org/repo", "pin", "a.xml");
+        assert_eq!(
+            hf_complete_snapshot_in(&caches, "org/repo", "pin", &files),
+            None
+        );
+
+        let bin = add_cached_model(dir.path(), "org/repo", "pin", "a.bin");
+        assert_eq!(
+            hf_complete_snapshot_in(&caches, "org/repo", "pin", &files),
+            bin.parent().map(Path::to_path_buf)
+        );
     }
     use std::fs::File;
     use std::io::Write;
