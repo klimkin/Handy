@@ -305,7 +305,9 @@ enum VadSlot {
 pub struct StoppedRecording {
     pub samples: Vec<f32>,
     pub run: RunId,
-    /// Microphone frames the recorder dropped during the take.
+    /// Microphone frames the recorder dropped since the stream was armed, at
+    /// the device's rate. A stream kept listening was armed when the previous
+    /// take ended, so this includes the wait before the press.
     pub dropped_frames: u64,
     /// Why the recorder ended the take early, if it failed. Fixed
     /// vocabulary; the error text stays in the log.
@@ -1027,7 +1029,7 @@ impl AudioRecordingManager {
         };
         if end.dropped_frames > 0 {
             warn!(
-                "Recording completed after dropping {} microphone frames",
+                "Recording completed; the microphone dropped {} frames since it was armed",
                 end.dropped_frames
             );
         }

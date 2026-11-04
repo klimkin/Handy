@@ -771,6 +771,7 @@ impl ShortcutAction for TranscribeAction {
             let stopped = rm.stop_recording(&binding_id, cancel_generation);
             span.end(match &stopped {
                 Some(s) => Args {
+                    // Since the stream was armed, which can be before the press.
                     count: Some(s.dropped_frames),
                     code: s.recorder_failure,
                     ..Default::default()

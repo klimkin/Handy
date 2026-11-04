@@ -193,7 +193,13 @@ impl MicSink {
     /// Stored before the replay, so a recording that panics in it still comes
     /// back from `stop`.
     fn attach(&mut self, posted: Posted) {
+        let replayed = self
+            .history
+            .recent(posted.at)
+            .map(|packet| packet.valid_frames as u64)
+            .sum();
         let recording = self.recording.insert(posted.recording);
+        recording.set_replayed_frames(replayed);
         for packet in self.history.recent(posted.at) {
             recording.process_chunk(packet.chunk());
         }

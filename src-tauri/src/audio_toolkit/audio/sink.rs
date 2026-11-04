@@ -98,6 +98,9 @@ pub struct CaptureSink {
     run: RunId,
     saw_vad: bool,
     saw_speech: bool,
+    /// Pre-roll frames replayed ahead of the live audio, counted on the
+    /// first-audio event.
+    replayed_frames: u64,
 }
 
 /// Spectrum window at 16 kHz: 32 ms, near the overlay's ~30 Hz refresh.
@@ -138,6 +141,7 @@ impl CaptureSink {
             run,
             saw_vad: false,
             saw_speech: false,
+            replayed_frames: 0,
         }
     }
 
@@ -149,6 +153,12 @@ impl CaptureSink {
     /// Samples per detector frame: the chunk size this sink expects.
     pub fn frame_samples(&self) -> usize {
         self.vad.frame_samples()
+    }
+
+    /// The first `frames` this sink is fed are pre-roll from before the
+    /// press.
+    pub(super) fn set_replayed_frames(&mut self, frames: u64) {
+        self.replayed_frames = frames;
     }
 
     /// Hands back the recording and the detector. Logs what VAD still held
@@ -190,7 +200,14 @@ impl Sink for CaptureSink {
             let _ = ready.send(());
             // Delivery latency through handy-recorder: the recorder exposes
             // no sample timestamps, so first delivery is the earliest marker.
-            diagnostics::instant(self.run, Name::FirstAudioDelivered, Args::default());
+            diagnostics::instant(
+                self.run,
+                Name::FirstAudioDelivered,
+                Args {
+                    count: (self.replayed_frames > 0).then_some(self.replayed_frames),
+                    ..Default::default()
+                },
+            );
         }
         if !self.heard_sound && !chunk.is_digital_silence() {
             self.heard_sound = true;
