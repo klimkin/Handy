@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { listen } from "@tauri-apps/api/event";
 import { commands, type LoadError, type OpenVinoDevice } from "@/bindings";
 import { Dropdown, SettingContainer } from "@/components/ui";
+import { Alert } from "../../ui/Alert";
 import { Button } from "../../ui/Button";
 import { useSettings } from "../../../hooks/useSettings";
 import { useModelStore } from "../../../stores/modelStore";
@@ -31,14 +33,13 @@ export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
   const { t } = useTranslation();
   const { getSetting, updateSetting, isUpdating } = useSettings();
   const device = getSetting("post_process_openvino_device") ?? "npu";
-  const percentage = useModelStore(
-    (s) => s.downloadProgress[modelId]?.percentage ?? 0,
-  );
+  const progress = useModelStore((s) => s.downloadProgress[modelId]);
+  const [starting, setStarting] = useState(false);
   const [readiness, setReadiness] = useState<Readiness>({
     status: "checking",
   });
-  const [isDownloading, setIsDownloading] = useState(false);
   const latestPrepare = useRef(0);
+  const downloading = starting || progress !== undefined;
 
   const prepare = useCallback(async () => {
     const request = ++latestPrepare.current;
@@ -54,7 +55,13 @@ export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
 
   useEffect(() => {
     void prepare();
-  }, [prepare]);
+    const unlisten = listen<string>("model-download-complete", (event) => {
+      if (event.payload === modelId) void prepare();
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, [prepare, modelId]);
 
   const handleDeviceSelect = async (value: string) => {
     await updateSetting(
@@ -65,30 +72,41 @@ export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
   };
 
   const handleDownload = async () => {
-    setIsDownloading(true);
-    const result = await commands.downloadOpenvinoModel(modelId);
-    setIsDownloading(false);
-    if (result.status === "ok") await prepare();
+    setStarting(true);
+    try {
+      // Failure notices come from the model store's download-failed listener.
+      await commands.downloadOpenvinoModel(modelId);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setStarting(false);
+    void useModelStore.getState().cancelDownload(modelId);
   };
 
   const deviceOptions = (
     Object.keys(DEVICE_LABEL_KEYS) as OpenVinoDevice[]
   ).map((value) => ({ value, label: t(DEVICE_LABEL_KEYS[value]) }));
 
+  const loadError =
+    !downloading &&
+    readiness.status === "failed" &&
+    readiness.error !== "model_not_downloaded"
+      ? readiness.error
+      : null;
+
   const renderStatus = () => {
-    if (isDownloading) {
+    if (downloading) {
       return (
         <>
           <span className="text-sm text-ink-3">
             {t("settings.postProcessing.api.openVino.downloading", {
-              percentage: Math.round(percentage),
+              percentage: Math.round(progress?.percentage ?? 0),
             })}
           </span>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void commands.cancelDownload(modelId)}
-          >
+          <Button variant="secondary" size="sm" onClick={handleCancel}>
             {t("settings.postProcessing.api.openVino.cancel")}
           </Button>
         </>
@@ -108,25 +126,23 @@ export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
           </span>
         );
       case "failed":
-        return (
+        return readiness.error === "model_not_downloaded" ? (
           <>
             <span className="text-sm text-ink-3">
-              {t(ERROR_LABEL_KEYS[readiness.error])}
+              {t(ERROR_LABEL_KEYS.model_not_downloaded)}
             </span>
-            {readiness.error === "model_not_downloaded" ? (
-              <Button variant="primary" size="sm" onClick={handleDownload}>
-                {t("settings.postProcessing.api.openVino.download")}
-              </Button>
-            ) : (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => void prepare()}
-              >
-                {t("settings.postProcessing.api.openVino.retry")}
-              </Button>
-            )}
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => void handleDownload()}
+            >
+              {t("settings.postProcessing.api.openVino.download")}
+            </Button>
           </>
+        ) : (
+          <Button variant="secondary" size="sm" onClick={() => void prepare()}>
+            {t("settings.postProcessing.api.openVino.retry")}
+          </Button>
         );
     }
   };
@@ -146,7 +162,7 @@ export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
           options={deviceOptions}
           selectedValue={device}
           onSelect={(value) => void handleDeviceSelect(value)}
-          disabled={isUpdating("post_process_openvino_device") || isDownloading}
+          disabled={isUpdating("post_process_openvino_device") || downloading}
         />
       </SettingContainer>
       <SettingContainer
@@ -160,6 +176,11 @@ export const OpenVinoSettings: React.FC<{ modelId: string }> = ({
       >
         <div className="flex items-center gap-2">{renderStatus()}</div>
       </SettingContainer>
+      {loadError && (
+        <Alert variant="error" contained>
+          {t(ERROR_LABEL_KEYS[loadError])}
+        </Alert>
+      )}
     </>
   );
 };

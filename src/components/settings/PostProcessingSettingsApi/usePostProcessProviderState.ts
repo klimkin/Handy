@@ -188,9 +188,14 @@ export const usePostProcessProviderState = (): PostProcessProviderState => {
   );
 
   const handleRefreshModels = useCallback(() => {
-    if (isAppleProvider) return;
+    if (isAppleProvider || isOpenVinoProvider) return;
     void fetchPostProcessModels(selectedProviderId);
-  }, [fetchPostProcessModels, isAppleProvider, selectedProviderId]);
+  }, [
+    fetchPostProcessModels,
+    isAppleProvider,
+    isOpenVinoProvider,
+    selectedProviderId,
+  ]);
 
   const availableModelsRaw = postProcessModelOptions[selectedProviderId] || [];
 
