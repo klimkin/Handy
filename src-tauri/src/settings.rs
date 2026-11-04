@@ -797,16 +797,6 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         });
     }
 
-    providers.push(PostProcessProvider {
-        id: OPENVINO_PROVIDER_ID.to_string(),
-        label: "OpenVINO".to_string(),
-        base_url: "openvino://local".to_string(),
-        allow_base_url_edit: false,
-        models_endpoint: None,
-        supports_structured_output: true,
-        api_format: PostProcessApiFormat::OpenAi,
-    });
-
     // AWS Bedrock via Mantle (OpenAI-compatible endpoint)
     providers.push(PostProcessProvider {
         id: "bedrock_mantle".to_string(),
@@ -814,6 +804,16 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         base_url: "https://bedrock-mantle.us-east-1.api.aws/v1".to_string(),
         allow_base_url_edit: false,
         models_endpoint: Some("/models".to_string()),
+        supports_structured_output: true,
+        api_format: PostProcessApiFormat::OpenAi,
+    });
+
+    providers.push(PostProcessProvider {
+        id: OPENVINO_PROVIDER_ID.to_string(),
+        label: "OpenVINO".to_string(),
+        base_url: "openvino://local".to_string(),
+        allow_base_url_edit: false,
+        models_endpoint: None,
         supports_structured_output: true,
         api_format: PostProcessApiFormat::OpenAi,
     });
@@ -955,6 +955,16 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
                     .insert(provider.id.clone(), default_model);
                 changed = true;
             }
+        }
+    }
+
+    // A provider added in a later release is appended after Custom above.
+    let providers = &mut settings.post_process_providers;
+    if let Some(index) = providers.iter().position(|p| p.id == "custom") {
+        if index + 1 != providers.len() {
+            let custom = providers.remove(index);
+            providers.push(custom);
+            changed = true;
         }
     }
 
@@ -2042,6 +2052,28 @@ mod tests {
         let format_of = |id: &str| settings.post_process_provider(id).unwrap().api_format;
         assert_eq!(format_of("anthropic"), PostProcessApiFormat::Anthropic);
         assert_eq!(format_of("custom"), PostProcessApiFormat::Anthropic);
+    }
+
+    #[test]
+    fn post_process_defaults_keep_custom_last_after_adding_a_provider() {
+        let mut settings = get_default_settings();
+        settings
+            .post_process_providers
+            .retain(|p| p.id != OPENVINO_PROVIDER_ID);
+
+        assert!(ensure_post_process_defaults(&mut settings));
+
+        let ids: Vec<&str> = settings
+            .post_process_providers
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        let defaults: Vec<String> = default_post_process_providers()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, defaults);
+        assert!(!ensure_post_process_defaults(&mut settings));
     }
 
     #[test]
