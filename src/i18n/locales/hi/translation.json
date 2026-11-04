@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "डिवाइस",
+            "description": "क्लीनअप मॉडल कहाँ चलता है. NPU, CPU और GPU को दूसरे कामों के लिए खाली छोड़ता है.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "मॉडल",
+            "description": "डिवाइस पर चलने वाला मॉडल, जो ट्रांसक्रिप्ट को साफ़ करता है. यह एक बार डाउनलोड होता है और इंटरनेट कनेक्शन के बिना चलता है."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "मॉडल लोड हो रहा है...",
+          "ready": "तैयार",
+          "download": "डाउनलोड करें",
+          "downloading": "{{percentage}}% डाउनलोड हो रहा है",
+          "cancel": "रद्द करें",
+          "retry": "फिर से कोशिश करें",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "यह मॉडल उपलब्ध नहीं है.",
+            "modelNotDownloaded": "मॉडल अभी डाउनलोड नहीं हुआ है.",
+            "libraryMissing": "OpenVINO GenAI रनटाइम नहीं मिला. इसे इंस्टॉल करें और Handy को रीस्टार्ट करें.",
+            "deviceFailed": "इस डिवाइस पर मॉडल लोड नहीं हो सका. कोई दूसरा डिवाइस आज़माएँ."
           }
         },
         "baseUrl": {

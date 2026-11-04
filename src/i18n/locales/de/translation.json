@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Gerät",
+            "description": "Wo das Bereinigungsmodell läuft. Die NPU hält CPU und GPU für andere Aufgaben frei.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "Modell",
+            "description": "Das lokale Modell, das Transkripte bereinigt. Es wird einmal heruntergeladen und läuft ohne Internetverbindung."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Modell wird geladen...",
+          "ready": "Bereit",
+          "download": "Herunterladen",
+          "downloading": "Herunterladen {{percentage}}%",
+          "cancel": "Abbrechen",
+          "retry": "Erneut versuchen",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Dieses Modell wird nicht angeboten.",
+            "modelNotDownloaded": "Das Modell ist noch nicht heruntergeladen.",
+            "libraryMissing": "Die Laufzeitumgebung OpenVINO GenAI wurde nicht gefunden. Installiere sie und starte Handy neu.",
+            "deviceFailed": "Das Modell konnte auf diesem Gerät nicht geladen werden. Versuche ein anderes Gerät."
           }
         },
         "baseUrl": {

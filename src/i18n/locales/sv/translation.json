@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Enhet",
+            "description": "Var rensningsmodellen körs. NPU:n lämnar CPU:n och GPU:n fria för annat arbete.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "Modell",
+            "description": "Den lokala modellen som rensar transkriptioner. Den laddas ner en gång och körs utan internetanslutning."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Laddar modell...",
+          "ready": "Redo",
+          "download": "Ladda ner",
+          "downloading": "Laddar ner {{percentage}}%",
+          "cancel": "Avbryt",
+          "retry": "Försök igen",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Den här modellen erbjuds inte.",
+            "modelNotDownloaded": "Modellen är inte nedladdad än.",
+            "libraryMissing": "OpenVINO GenAI-körmiljön hittades inte. Installera den och starta om Handy.",
+            "deviceFailed": "Modellen kunde inte läsas in på den här enheten. Prova en annan enhet."
           }
         },
         "baseUrl": {

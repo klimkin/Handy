@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Zařízení",
+            "description": "Kde běží model pro čištění přepisů. NPU nechává CPU a GPU volné pro jinou práci.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -660,19 +660,19 @@
           },
           "model": {
             "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "description": "Místní model, který čistí přepisy. Stáhne se jednou a funguje bez připojení k internetu."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Načítání modelu...",
+          "ready": "Připraveno",
+          "download": "Stáhnout",
+          "downloading": "Stahování {{percentage}}%",
+          "cancel": "Zrušit",
+          "retry": "Zkusit znovu",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Tento model není k dispozici.",
+            "modelNotDownloaded": "Model ještě není stažený.",
+            "libraryMissing": "Běhové prostředí OpenVINO GenAI nebylo nalezeno. Nainstalujte ho a restartujte Handy.",
+            "deviceFailed": "Model se na tomto zařízení nepodařilo načíst. Zkuste jiné zařízení."
           }
         },
         "baseUrl": {

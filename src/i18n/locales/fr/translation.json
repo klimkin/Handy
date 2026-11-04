@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Périphérique",
+            "description": "Où s'exécute le modèle de nettoyage. Le NPU laisse le CPU et le GPU libres pour d'autres tâches.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "Modèle",
+            "description": "Le modèle local qui nettoie les transcriptions. Il est téléchargé une seule fois et fonctionne sans connexion Internet."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Chargement du modèle...",
+          "ready": "Prêt",
+          "download": "Télécharger",
+          "downloading": "Téléchargement {{percentage}}%",
+          "cancel": "Annuler",
+          "retry": "Réessayer",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Ce modèle n'est pas proposé.",
+            "modelNotDownloaded": "Le modèle n'est pas encore téléchargé.",
+            "libraryMissing": "L'environnement d'exécution OpenVINO GenAI est introuvable. Installez-le et redémarrez Handy.",
+            "deviceFailed": "Le modèle n'a pas pu se charger sur ce périphérique. Essayez un autre périphérique."
           }
         },
         "baseUrl": {

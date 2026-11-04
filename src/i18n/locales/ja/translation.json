@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "デバイス",
+            "description": "クリーンアップモデルを実行する場所です。NPU を使うと CPU と GPU を他の作業に使えます。",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "モデル",
+            "description": "文字起こしを整えるオンデバイスモデルです。一度ダウンロードすれば、インターネット接続なしで動作します。"
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "モデルを読み込み中…",
+          "ready": "準備完了",
+          "download": "ダウンロード",
+          "downloading": "ダウンロード中 {{percentage}}%",
+          "cancel": "キャンセル",
+          "retry": "再試行",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "このモデルは提供されていません。",
+            "modelNotDownloaded": "モデルはまだダウンロードされていません。",
+            "libraryMissing": "OpenVINO GenAI ランタイムが見つかりません。インストールしてから Handy を再起動してください。",
+            "deviceFailed": "このデバイスではモデルを読み込めませんでした。別のデバイスをお試しください。"
           }
         },
         "baseUrl": {

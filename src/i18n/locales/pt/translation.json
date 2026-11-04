@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Dispositivo",
+            "description": "Onde o modelo de limpeza é executado. A NPU deixa a CPU e a GPU livres para outras tarefas.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "Modelo",
+            "description": "O modelo local que limpa as transcrições. Ele é baixado uma vez e funciona sem conexão com a internet."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Carregando modelo...",
+          "ready": "Pronto",
+          "download": "Baixar",
+          "downloading": "Baixando {{percentage}}%",
+          "cancel": "Cancelar",
+          "retry": "Tentar novamente",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Este modelo não está disponível.",
+            "modelNotDownloaded": "O modelo ainda não foi baixado.",
+            "libraryMissing": "O runtime do OpenVINO GenAI não foi encontrado. Instale-o e reinicie o Handy.",
+            "deviceFailed": "Não foi possível carregar o modelo neste dispositivo. Tente outro dispositivo."
           }
         },
         "baseUrl": {

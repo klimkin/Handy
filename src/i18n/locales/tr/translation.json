@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Cihaz",
+            "description": "Temizleme modelinin çalıştığı yer. NPU, CPU ve GPU'yu diğer işler için boş bırakır.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -660,19 +660,19 @@
           },
           "model": {
             "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "description": "Transkripsiyonları temizleyen, cihaz üzerinde çalışan model. Bir kez indirilir ve internet bağlantısı olmadan çalışır."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Model yükleniyor...",
+          "ready": "Hazır",
+          "download": "İndir",
+          "downloading": "%{{percentage}} indiriliyor",
+          "cancel": "İptal",
+          "retry": "Tekrar dene",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Bu model sunulmuyor.",
+            "modelNotDownloaded": "Model henüz indirilmedi.",
+            "libraryMissing": "OpenVINO GenAI çalışma zamanı bulunamadı. Yükleyip Handy'yi yeniden başlatın.",
+            "deviceFailed": "Model bu cihazda yüklenemedi. Başka bir cihaz deneyin."
           }
         },
         "baseUrl": {

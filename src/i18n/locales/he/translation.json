@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "התקן",
+            "description": "היכן רץ מודל הניקוי. ה-NPU משאיר את ה-CPU וה-GPU פנויים לעבודה אחרת.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "מודל",
+            "description": "המודל המקומי שמנקה את התמלולים. הוא מורד פעם אחת ופועל ללא חיבור לאינטרנט."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "טוען מודל...",
+          "ready": "מוכן",
+          "download": "הורד",
+          "downloading": "מוריד {{percentage}}%",
+          "cancel": "ביטול",
+          "retry": "ניסיון חוזר",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "המודל הזה אינו מוצע.",
+            "modelNotDownloaded": "המודל עדיין לא הורד.",
+            "libraryMissing": "סביבת ההרצה של OpenVINO GenAI לא נמצאה. התקן אותה והפעל מחדש את Handy.",
+            "deviceFailed": "לא ניתן לטעון את המודל בהתקן הזה. נסה התקן אחר."
           }
         },
         "baseUrl": {

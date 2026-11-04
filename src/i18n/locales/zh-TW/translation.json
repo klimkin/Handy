@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "裝置",
+            "description": "清理模型的執行位置。使用 NPU 可讓 CPU 和 GPU 空出來處理其他工作。",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "模型",
+            "description": "在本機清理轉錄內容的模型。只需下載一次，無需連網即可執行。"
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "正在載入模型...",
+          "ready": "已就緒",
+          "download": "下載",
+          "downloading": "下載中 {{percentage}}%",
+          "cancel": "取消",
+          "retry": "重試",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "不提供此模型。",
+            "modelNotDownloaded": "模型尚未下載。",
+            "libraryMissing": "找不到 OpenVINO GenAI 執行環境。請安裝後重新啟動 Handy。",
+            "deviceFailed": "無法在此裝置上載入模型。請嘗試其他裝置。"
           }
         },
         "baseUrl": {

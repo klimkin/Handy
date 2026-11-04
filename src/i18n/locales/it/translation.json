@@ -650,8 +650,8 @@
         },
         "openVino": {
           "device": {
-            "title": "Device",
-            "description": "Where the cleanup model runs. The NPU leaves the CPU and GPU free for other work.",
+            "title": "Dispositivo",
+            "description": "Dove viene eseguito il modello di pulizia. La NPU lascia CPU e GPU libere per altri lavori.",
             "options": {
               "npu": "NPU",
               "gpu": "GPU",
@@ -659,20 +659,20 @@
             }
           },
           "model": {
-            "title": "Model",
-            "description": "The on-device model that cleans transcripts. It is downloaded once and runs without an internet connection."
+            "title": "Modello",
+            "description": "Il modello locale che ripulisce le trascrizioni. Viene scaricato una sola volta e funziona senza connessione a Internet."
           },
-          "checking": "Loading the model...",
-          "ready": "Ready",
-          "download": "Download",
-          "downloading": "Downloading {{percentage}}%",
-          "cancel": "Cancel",
-          "retry": "Try Again",
+          "checking": "Caricamento del modello...",
+          "ready": "Pronto",
+          "download": "Scarica",
+          "downloading": "Download {{percentage}}%",
+          "cancel": "Annulla",
+          "retry": "Riprova",
           "errors": {
-            "unknownModel": "This model is not offered.",
-            "modelNotDownloaded": "The model is not downloaded yet.",
-            "libraryMissing": "The OpenVINO GenAI runtime was not found. Install it and restart Handy.",
-            "deviceFailed": "The model could not load on this device. Try another device."
+            "unknownModel": "Questo modello non è disponibile.",
+            "modelNotDownloaded": "Il modello non è ancora stato scaricato.",
+            "libraryMissing": "Il runtime di OpenVINO GenAI non è stato trovato. Installalo e riavvia Handy.",
+            "deviceFailed": "Impossibile caricare il modello su questo dispositivo. Prova un altro dispositivo."
           }
         },
         "baseUrl": {
