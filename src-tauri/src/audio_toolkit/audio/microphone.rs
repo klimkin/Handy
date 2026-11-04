@@ -34,11 +34,19 @@ pub struct StreamEnd {
 }
 
 impl OpenMicrophone {
-    pub fn open(config: RecorderConfig) -> Result<Self, Error> {
-        Self::open_with(|on_failure| Recorder::open_with_failure_handler(config, on_failure))
+    /// Opens the device. `on_failure` runs once if the recorder fails, after
+    /// `needs_reopen` turns true, on a thread of its own.
+    pub fn open(
+        config: RecorderConfig,
+        on_failure: impl FnOnce(ErrorKind) + Send + 'static,
+    ) -> Result<Self, Error> {
+        Self::open_with(on_failure, |handler| {
+            Recorder::open_with_failure_handler(config, handler)
+        })
     }
 
     pub(super) fn open_with(
+        on_failure: impl FnOnce(ErrorKind) + Send + 'static,
         open: impl FnOnce(Box<dyn FnOnce(Error) + Send>) -> Result<Recorder<MicSink>, Error>,
     ) -> Result<Self, Error> {
         let failure = Arc::new(OnceLock::new());
@@ -46,7 +54,9 @@ impl OpenMicrophone {
         let recorder = open(Box::new({
             let failure = Arc::clone(&failure);
             move |error| {
+                let kind = error.kind();
                 let _ = failure.set(error);
+                on_failure(kind);
             }
         }))?;
         Ok(Self {

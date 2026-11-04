@@ -442,21 +442,18 @@ fn open_microphone_on_channel(
     channel: Option<u16>,
     take_headset: bool,
     frames_per_chunk: usize,
+    on_failure: impl FnOnce(ErrorKind) + Clone + Send + 'static,
 ) -> Result<OpenMicrophone, handy_recorder::Error> {
-    match OpenMicrophone::open(microphone_config(
-        device.clone(),
-        channel,
-        take_headset,
-        frames_per_chunk,
-    )) {
+    match OpenMicrophone::open(
+        microphone_config(device.clone(), channel, take_headset, frames_per_chunk),
+        on_failure.clone(),
+    ) {
         Err(error) if error.kind() == ErrorKind::InvalidChannel => {
             warn!("{error}; averaging all input channels instead");
-            OpenMicrophone::open(microphone_config(
-                device,
-                None,
-                take_headset,
-                frames_per_chunk,
-            ))
+            OpenMicrophone::open(
+                microphone_config(device, None, take_headset, frames_per_chunk),
+                on_failure,
+            )
         }
         result => result,
     }
@@ -526,9 +523,10 @@ pub struct AudioRecordingManager {
     /// Resolution of a *named* microphone (selected or clamshell) to its
     /// recorder device ID, cached so on-demand recording starts skip an extra
     /// device enumeration. Keyed by the resolved name, so a settings change
-    /// misses naturally; cleared when an open fails (device unplugged) so the
-    /// retry re-enumerates. The system-default case is never cached — the
-    /// recorder resolves the current default itself.
+    /// misses naturally; cleared when an open or the open microphone fails
+    /// (device unplugged) so the next open re-enumerates. The system-default
+    /// case is never cached — the recorder resolves the current default
+    /// itself.
     cached_device: Arc<Mutex<Option<(String, String)>>>,
     /// The last recording was all-zero samples, not just audio without speech.
     last_input_silent: Arc<AtomicBool>,
@@ -609,6 +607,12 @@ impl AudioRecordingManager {
 
     pub fn invalidate_device_cache(&self) {
         *self.cached_device.lock().unwrap() = None;
+    }
+
+    /// Runs on a thread of its own when an open microphone fails.
+    fn on_microphone_failure(&self) -> impl FnOnce(ErrorKind) + Clone + Send + 'static {
+        let cached_device = Arc::clone(&self.cached_device);
+        move |_| *cached_device.lock().unwrap() = None
     }
 
     fn resolve_microphone_device(&self, settings: &AppSettings) -> MicrophoneResolution {
@@ -855,7 +859,6 @@ impl AudioRecordingManager {
             let failed = self.recorder.lock().unwrap().take();
             drop(failed);
             *open_flag = false;
-            self.invalidate_device_cache();
             // Fall through to the same fresh resolution and fallback path used
             // when an on-demand stream opens after its device was unplugged.
         }
@@ -891,12 +894,14 @@ impl AudioRecordingManager {
 
         let channel = *self.selected_channel.lock().unwrap();
         let take_headset = self.airpods_mode.load(Ordering::Acquire);
+        let on_failure = self.on_microphone_failure();
         let open_started = Instant::now();
         let microphone = Arc::new(match open_microphone_on_channel(
             resolution.device.clone(),
             channel,
             take_headset,
             frames_per_chunk,
+            on_failure.clone(),
         ) {
             Err(first_err) if resolution.from_cache => {
                 // The cached device ID may have gone stale (unplugged).
@@ -910,6 +915,7 @@ impl AudioRecordingManager {
                     channel,
                     take_headset,
                     frames_per_chunk,
+                    on_failure,
                 )
             }
             result => result,

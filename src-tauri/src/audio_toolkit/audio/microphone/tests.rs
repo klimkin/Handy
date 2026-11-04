@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use handy_recorder::testing::{FakeError, FakeMic};
-use handy_recorder::{EndReason, Recorder};
+use handy_recorder::{EndReason, ErrorKind, Recorder};
 
 use super::{OpenMicrophone, Sealed};
 use crate::audio_toolkit::audio::mic_sink::HISTORY_FRAMES;
@@ -254,4 +254,29 @@ fn a_device_failure_mid_take_keeps_the_audio_before_it() {
         Ok(end) if matches!(end.reason, EndReason::RecorderFailed(_))
     ));
     assert_eq!(samples(sealed), ramp(1, FRAMES));
+}
+
+#[test]
+fn a_failure_reaches_the_opener_once_the_microphone_needs_reopening() {
+    let fake = FakeMic::new(16_000, 1);
+    let (failed_tx, failed) = mpsc::channel();
+    let (resume_tx, resume) = mpsc::channel::<()>();
+    let mic = OpenMicrophone::open_with(
+        move |kind| {
+            failed_tx.send(kind).unwrap();
+            let _ = resume.recv();
+        },
+        |on_failure| fake.open(config(), Some(on_failure), OPEN_TIMEOUT),
+    )
+    .expect("the fake microphone opens");
+    arm(&mic);
+
+    assert!(fake.report_error(FakeError::DeviceNotAvailable));
+
+    assert_eq!(
+        failed.recv_timeout(Duration::from_secs(2)),
+        Ok(ErrorKind::DeviceLost)
+    );
+    assert!(mic.needs_reopen());
+    drop(resume_tx);
 }

@@ -62,8 +62,11 @@ pub(crate) fn config() -> RecorderConfig {
 }
 
 pub(crate) fn open(fake: &FakeMic) -> OpenMicrophone {
-    OpenMicrophone::open_with(|on_failure| fake.open(config(), Some(on_failure), OPEN_TIMEOUT))
-        .expect("the fake microphone opens")
+    OpenMicrophone::open_with(
+        |_| {},
+        |on_failure| fake.open(config(), Some(on_failure), OPEN_TIMEOUT),
+    )
+    .expect("the fake microphone opens")
 }
 
 pub(crate) fn play(fake: &FakeMic, channels: u16, first: usize, frames: usize) {
