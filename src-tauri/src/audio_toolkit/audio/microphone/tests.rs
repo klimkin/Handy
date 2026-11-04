@@ -190,7 +190,6 @@ fn quick_takes_share_no_audio() {
         takes
     });
 
-    let mut gaps = Vec::new();
     for take in &takes {
         let (first, last) = (take[0] as usize, take[take.len() - 1] as usize);
         assert_eq!(take, &ramp(first, last), "a take loses nothing inside it");
@@ -198,10 +197,7 @@ fn quick_takes_share_no_audio() {
     for pair in takes.windows(2) {
         let (last, next) = (pair[0][pair[0].len() - 1] as usize, pair[1][0] as usize);
         assert!(next > last, "frame {next} is in two takes");
-        gaps.push(next - last - 1);
     }
-    gaps.sort_unstable();
-    eprintln!("frames lost between quick takes, sorted: {gaps:?}");
 }
 
 #[test]
