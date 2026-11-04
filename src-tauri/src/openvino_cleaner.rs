@@ -3,11 +3,14 @@ use crate::settings::{
     AppSettings, OpenVinoDevice, OPENVINO_DEFAULT_MODEL_ID, OPENVINO_PROVIDER_ID,
 };
 use log::{error, info, warn};
-use openvino_genai::{ChatHistory, ChatMessage, GenerationConfig, LlmPipeline};
+use openvino_genai::{
+    ChatHistory, ChatMessage, GenerationConfig, LlmPipeline, Streamer, StreamingStatus,
+};
 use serde::Serialize;
 use specta::Type;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// NPU static shapes, in tokens. Unmeasured proposals, not crate requirements.
@@ -114,9 +117,11 @@ impl OpenVinoCleaner {
             ChatMessage::system(system_prompt),
             ChatMessage::user(transcription),
         ];
+        let stop = StopOnDrop::default();
+        let stopped = Arc::clone(&stop.0);
         self.with_pipeline(
             key,
-            move |pipeline| generate(pipeline, &messages),
+            move |pipeline| generate(pipeline, &messages, stopped),
             CleanerError::GenerateFailed,
         )
         .await
@@ -146,6 +151,25 @@ impl OpenVinoCleaner {
             error!("OpenVINO worker panicked: {e}");
             Err(panicked)
         })
+    }
+}
+
+/// Asks generation to stop once nobody awaits it, so a cancelled dictation
+/// releases the device at the next token instead of after the whole reply.
+#[derive(Default)]
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn streaming_status(stopped: &AtomicBool) -> StreamingStatus {
+    if stopped.load(Ordering::Relaxed) {
+        StreamingStatus::Stop
+    } else {
+        StreamingStatus::Running
     }
 }
 
@@ -200,7 +224,11 @@ fn load_pipeline((dir, device): &LoadKey, cache_dir: &Path) -> Result<LlmPipelin
     })
 }
 
-fn generate(pipeline: &mut LlmPipeline, messages: &[ChatMessage]) -> Result<String, CleanerError> {
+fn generate(
+    pipeline: &mut LlmPipeline,
+    messages: &[ChatMessage],
+    stopped: Arc<AtomicBool>,
+) -> Result<String, CleanerError> {
     let mut history = ChatHistory::new().map_err(generate_failed)?;
     for message in messages {
         history.push(message).map_err(generate_failed)?;
@@ -209,8 +237,9 @@ fn generate(pipeline: &mut LlmPipeline, messages: &[ChatMessage]) -> Result<Stri
     config
         .set_max_new_tokens(MIN_RESPONSE_LEN)
         .map_err(generate_failed)?;
+    let streamer = Streamer::new(move |_| streaming_status(&stopped));
     let text = pipeline
-        .generate_with_history(&history, Some(&config), None)
+        .generate_with_history(&history, Some(&config), Some(&streamer))
         .and_then(|results| results.get_string())
         .map_err(generate_failed)?;
     if text.trim().is_empty() {
@@ -306,6 +335,18 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn generation_stops_once_the_caller_stops_waiting() {
+        let stop = StopOnDrop::default();
+        let stopped = Arc::clone(&stop.0);
+        assert!(matches!(
+            streaming_status(&stopped),
+            StreamingStatus::Running
+        ));
+        drop(stop);
+        assert!(matches!(streaming_status(&stopped), StreamingStatus::Stop));
     }
 
     #[test]
