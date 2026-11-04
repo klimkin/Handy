@@ -3,7 +3,7 @@ use crate::settings::{
     AppSettings, OpenVinoDevice, OPENVINO_DEFAULT_MODEL_ID, OPENVINO_PROVIDER_ID,
 };
 use log::{error, info, warn};
-use openvino_genai::{GenerationConfig, LlmPipeline};
+use openvino_genai::{ChatHistory, ChatMessage, GenerationConfig, LlmPipeline};
 use serde::Serialize;
 use specta::Type;
 use std::fmt;
@@ -101,15 +101,22 @@ impl OpenVinoCleaner {
     pub async fn clean(
         &self,
         settings: &AppSettings,
-        template: &str,
+        system_prompt: &str,
         transcription: &str,
     ) -> Result<String, CleanerError> {
-        let prompt = fill_prompt(template, transcription);
-        check_prompt_budget(settings.post_process_openvino_device, &prompt)?;
+        check_prompt_budget(
+            settings.post_process_openvino_device,
+            system_prompt,
+            transcription,
+        )?;
         let key = resolve_key(settings)?;
+        let messages = [
+            ChatMessage::system(system_prompt),
+            ChatMessage::user(transcription),
+        ];
         self.with_pipeline(
             key,
-            move |pipeline| generate(pipeline, &prompt),
+            move |pipeline| generate(pipeline, &messages),
             CleanerError::GenerateFailed,
         )
         .await
@@ -193,13 +200,17 @@ fn load_pipeline((dir, device): &LoadKey, cache_dir: &Path) -> Result<LlmPipelin
     })
 }
 
-fn generate(pipeline: &mut LlmPipeline, prompt: &str) -> Result<String, CleanerError> {
+fn generate(pipeline: &mut LlmPipeline, messages: &[ChatMessage]) -> Result<String, CleanerError> {
+    let mut history = ChatHistory::new().map_err(generate_failed)?;
+    for message in messages {
+        history.push(message).map_err(generate_failed)?;
+    }
     let mut config = GenerationConfig::new().map_err(generate_failed)?;
     config
         .set_max_new_tokens(MIN_RESPONSE_LEN)
         .map_err(generate_failed)?;
     let text = pipeline
-        .generate(prompt, Some(&config), None)
+        .generate_with_history(&history, Some(&config), None)
         .and_then(|results| results.get_string())
         .map_err(generate_failed)?;
     if text.trim().is_empty() {
@@ -265,18 +276,13 @@ impl fmt::Display for CleanerError {
 
 impl std::error::Error for CleanerError {}
 
-/// The transcript replaces every `${output}`. A template without one still
-/// gets the transcript, on its own line at the end.
-fn fill_prompt(template: &str, transcription: &str) -> String {
-    if template.contains("${output}") {
-        template.replace("${output}", transcription)
-    } else {
-        format!("{template}\n{transcription}")
-    }
-}
-
-fn check_prompt_budget(device: OpenVinoDevice, prompt: &str) -> Result<(), CleanerError> {
-    if device == OpenVinoDevice::Npu && prompt.chars().count() > MAX_PROMPT_LEN * CHARS_PER_TOKEN {
+fn check_prompt_budget(
+    device: OpenVinoDevice,
+    system_prompt: &str,
+    transcription: &str,
+) -> Result<(), CleanerError> {
+    let chars = system_prompt.chars().count() + transcription.chars().count();
+    if device == OpenVinoDevice::Npu && chars > MAX_PROMPT_LEN * CHARS_PER_TOKEN {
         return Err(CleanerError::PromptTooLong);
     }
     Ok(())
@@ -303,20 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_is_replaced_by_the_transcript() {
-        let prompt = fill_prompt("<t>${output}</t> again ${output}", "hello there");
-        assert!(prompt.contains("hello there"));
-        assert!(!prompt.contains("${output}"));
-    }
-
-    #[test]
-    fn template_without_placeholder_still_sees_the_transcript() {
-        let prompt = fill_prompt("Clean this up.", "hello there");
-        assert!(prompt.contains("Clean this up."));
-        assert!(prompt.contains("hello there"));
-    }
-
-    #[test]
     fn npu_properties_fix_the_static_shapes() {
         let properties = load_properties(OpenVinoDevice::Npu, "cache");
         assert_eq!(property(&properties, "CACHE_DIR"), Some("cache"));
@@ -333,16 +325,23 @@ mod tests {
 
     #[test]
     fn a_prompt_over_the_npu_budget_is_too_long() {
-        let long = "a".repeat(4097);
+        let system = "a".repeat(4000);
+        let long = "b".repeat(97);
         assert_eq!(
-            check_prompt_budget(OpenVinoDevice::Npu, &long),
+            check_prompt_budget(OpenVinoDevice::Npu, &system, &long),
             Err(CleanerError::PromptTooLong)
         );
         assert_eq!(
-            check_prompt_budget(OpenVinoDevice::Npu, &"a".repeat(4096)),
+            check_prompt_budget(OpenVinoDevice::Npu, &system, &"b".repeat(96)),
             Ok(())
         );
-        assert_eq!(check_prompt_budget(OpenVinoDevice::Cpu, &long), Ok(()));
-        assert_eq!(check_prompt_budget(OpenVinoDevice::Gpu, &long), Ok(()));
+        assert_eq!(
+            check_prompt_budget(OpenVinoDevice::Cpu, &system, &long),
+            Ok(())
+        );
+        assert_eq!(
+            check_prompt_budget(OpenVinoDevice::Gpu, &system, &long),
+            Ok(())
+        );
     }
 }

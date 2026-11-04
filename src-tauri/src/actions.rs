@@ -307,16 +307,6 @@ async fn post_process_transcription(
         provider.id, model
     );
 
-    if provider.id == OPENVINO_PROVIDER_ID {
-        return match openvino.clean(settings, &prompt, transcription).await {
-            Ok(text) => PostProcessOutcome::Done(strip_invisible_chars(strip_think_block(&text))),
-            Err(err) => {
-                error!("OpenVINO post-processing failed: {err}");
-                PostProcessOutcome::Failed
-            }
-        };
-    }
-
     let api_key = settings
         .post_process_api_keys
         .get(&provider.id)
@@ -376,6 +366,26 @@ async fn post_process_transcription(
                 debug!("Apple Intelligence provider selected on unsupported platform");
                 return PostProcessOutcome::Failed;
             }
+        }
+
+        if provider.id == OPENVINO_PROVIDER_ID {
+            return match openvino
+                .clean(settings, &system_prompt, &user_content)
+                .await
+            {
+                Ok(result) => {
+                    let result = strip_invisible_chars(strip_think_block(&result));
+                    debug!(
+                        "OpenVINO post-processing succeeded. Output length: {} chars",
+                        result.len()
+                    );
+                    PostProcessOutcome::Done(result)
+                }
+                Err(err) => {
+                    error!("OpenVINO post-processing failed: {}", err);
+                    PostProcessOutcome::Failed
+                }
+            };
         }
 
         // Define JSON schema for transcription output
@@ -1214,7 +1224,7 @@ mod tests {
         strip_think_block, PostProcessOutcome,
     };
     use crate::openvino_cleaner::OpenVinoCleaner;
-    use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
+    use crate::settings::{get_default_settings, AppSettings, OverlayStyle, OPENVINO_PROVIDER_ID};
     use std::future;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1300,6 +1310,19 @@ mod tests {
         let url = serve_once(r#"{"choices":[]}"#);
         assert_eq!(
             run_post_process(&post_process_settings(&url), "hello"),
+            PostProcessOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn openvino_without_a_usable_model_failed() {
+        let mut settings = post_process_settings("http://127.0.0.1:1");
+        settings.post_process_provider_id = OPENVINO_PROVIDER_ID.to_string();
+        settings
+            .post_process_models
+            .insert(OPENVINO_PROVIDER_ID.to_string(), "not-offered".to_string());
+        assert_eq!(
+            run_post_process(&settings, "hello"),
             PostProcessOutcome::Failed
         );
     }
