@@ -746,7 +746,6 @@ impl AudioRecordingManager {
         }
     }
 
-    /// Lends the detector to a recording.
     /// Lends the detector to a new recording. Called only while idle.
     fn lend_vad(&self) -> Result<CaptureVad, anyhow::Error> {
         {
