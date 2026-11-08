@@ -600,10 +600,36 @@ impl AudioRecordingManager {
         *self.cached_device.lock().unwrap() = None;
     }
 
-    /// Runs on a thread of its own when an open microphone fails.
+    /// Runs on a thread of its own when an open microphone fails. The hook
+    /// lives inside the manager's microphone, so it looks the manager up
+    /// instead of holding it.
     fn on_microphone_failure(&self) -> impl FnOnce(ErrorKind) + Clone + Send + 'static {
         let cached_device = Arc::clone(&self.cached_device);
-        move |_| *cached_device.lock().unwrap() = None
+        let app = self.app_handle.clone();
+        move |failure| {
+            *cached_device.lock().unwrap() = None;
+            if let Some(manager) = app.try_state::<Arc<AudioRecordingManager>>() {
+                manager.recover(failure);
+            }
+        }
+    }
+
+    /// Reopens an idle stream that failed on its own, as an armed one does
+    /// across system sleep, so the next take still starts with its pre-roll.
+    fn recover(&self, failure: ErrorKind) {
+        let state = self.state.lock().unwrap();
+        if !matches!(*state, RecordingState::Idle) {
+            return;
+        }
+        let want = self.idle_stream();
+        let recovered = self
+            .stream
+            .lock()
+            .unwrap()
+            .recover(failure, Instant::now(), want, || self.open_microphone());
+        if let Err(error) = recovered {
+            warn!("Failed to reopen the microphone after it failed ({failure:?}): {error}");
+        }
     }
 
     fn resolve_microphone_device(&self, settings: &AppSettings) -> MicrophoneResolution {
