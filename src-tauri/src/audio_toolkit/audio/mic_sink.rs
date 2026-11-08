@@ -7,7 +7,7 @@ use handy_recorder::{AudioChunk, Sink};
 use super::CaptureSink;
 use crate::audio_toolkit::constants;
 
-pub(super) const HISTORY_FRAMES: usize = 96 * constants::WHISPER_SAMPLE_RATE as usize / 1_000;
+pub(crate) const HISTORY_FRAMES: usize = 96 * constants::WHISPER_SAMPLE_RATE as usize / 1_000;
 const MAX_PREROLL_AGE: Duration = Duration::from_millis(100);
 
 struct Packet {

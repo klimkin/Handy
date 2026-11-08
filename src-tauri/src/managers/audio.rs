@@ -13,11 +13,14 @@ use crate::notices::NoticeCode;
 use crate::settings::{get_settings, write_settings, AppSettings, VadBackend};
 use crate::utils;
 use handy_recorder::{Channels, EndReason, ErrorKind, RecorderConfig};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
+
+mod stream;
+use stream::{IdleStream, Stream};
 
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SILERO_VAD_THRESHOLD: f32 = 0.3;
@@ -459,12 +462,6 @@ fn open_microphone_on_channel(
     }
 }
 
-/// Never in AirPods mode: a listening recorder holds the headset, pinning it
-/// in its call profile.
-fn listens_between_takes(mode: MicrophoneMode, airpods: bool, failed: bool, current: bool) -> bool {
-    mode == MicrophoneMode::AlwaysOn && !airpods && !failed && current
-}
-
 /* ──────────────────────────────────────────────────────────────── */
 
 /// One recording session's first-sample notification. Waiting on this never
@@ -492,7 +489,7 @@ pub struct AudioRecordingManager {
     mode: Arc<Mutex<MicrophoneMode>>,
     app_handle: tauri::AppHandle,
 
-    recorder: Arc<Mutex<Option<Arc<OpenMicrophone>>>>,
+    stream: Arc<Mutex<Stream>>,
     vad: Arc<Mutex<VadSlot>>,
     /// Zero-based input channel to record, or `None` to average them all.
     /// Held here rather than read from settings, which are persisted only
@@ -506,7 +503,6 @@ pub struct AudioRecordingManager {
     /// VAD-passed frames for live streaming, via a shared `StreamRouter`
     /// (captured directly, not via Tauri state — see its docs).
     on_audio: AudioFrameCallback,
-    is_open: Arc<Mutex<bool>>,
     mute_state: Arc<Mutex<MuteState>>,
     close_generation: Arc<AtomicU64>,
     cancel_generation: Arc<AtomicU64>,
@@ -557,13 +553,12 @@ impl AudioRecordingManager {
             mode: Arc::new(Mutex::new(mode)),
             app_handle: app.clone(),
 
-            recorder: Arc::new(Mutex::new(None)),
+            stream: Arc::new(Mutex::new(Stream::default())),
             vad: Arc::new(Mutex::new(VadSlot::Unloaded)),
             selected_channel: Arc::new(Mutex::new(settings.selected_channel)),
             airpods_mode: Arc::new(AtomicBool::new(settings.airpods_mode)),
             on_levels,
             on_audio,
-            is_open: Arc::new(Mutex::new(false)),
             mute_state: Arc::new(Mutex::new(MuteState::default())),
             close_generation: Arc::new(AtomicU64::new(0)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
@@ -573,11 +568,7 @@ impl AudioRecordingManager {
             last_input_silent: Arc::new(AtomicBool::new(false)),
         };
 
-        // Always-on?  Open immediately.
-        if matches!(mode, MicrophoneMode::AlwaysOn) {
-            manager.start_microphone_stream()?;
-        }
-
+        manager.reconcile(&manager.state.lock().unwrap())?;
         Ok(manager)
     }
 
@@ -714,13 +705,11 @@ impl AudioRecordingManager {
             if rm.close_generation.load(Ordering::SeqCst) == gen
                 && matches!(*state, RecordingState::Idle)
             {
-                // stop_microphone_stream does not acquire the state lock,
-                // so holding it here is safe (no deadlock).
                 info!(
                     "Closing idle microphone stream after {:?}",
                     STREAM_IDLE_TIMEOUT
                 );
-                rm.stop_microphone_stream();
+                rm.stream.lock().unwrap().close();
             }
         });
     }
@@ -785,17 +774,21 @@ impl AudioRecordingManager {
 
     /* ---------- microphone life-cycle -------------------------------------- */
 
-    /// Applies mute if mute_while_recording is enabled and stream is open.
-    /// Snapshots the system's prior mute state first so `remove_mute` can
-    /// restore it instead of unconditionally unmuting.
+    /// Mutes the system while a take records, if mute_while_recording is
+    /// enabled. Snapshots the system's prior mute state first so
+    /// `remove_mute` can restore it instead of unconditionally unmuting.
     pub fn apply_mute(&self) {
         let settings = get_settings(&self.app_handle);
         if !settings.mute_while_recording {
             return;
         }
 
-        // Lock order: is_open before mute_state (matches stop_microphone_stream).
-        let is_open = self.is_open.lock().unwrap();
+        // Under the state lock, so the reconcile that ends the take removes
+        // whatever this applies.
+        let state = self.state.lock().unwrap();
+        if !matches!(*state, RecordingState::Recording { .. }) {
+            return;
+        }
         let mut mute_guard = self.mute_state.lock().unwrap();
         // Already muted this session — don't re-snapshot, or a duplicate/late
         // apply would overwrite prev_muted with our own forced-muted state and
@@ -803,12 +796,10 @@ impl AudioRecordingManager {
         if mute_guard.did_mute {
             return;
         }
-        if *is_open {
-            mute_guard.prev_muted = get_mute();
-            set_mute(true);
-            mute_guard.did_mute = true;
-            debug!("Mute applied (prev_muted={:?})", mute_guard.prev_muted);
-        }
+        mute_guard.prev_muted = get_mute();
+        set_mute(true);
+        mute_guard.did_mute = true;
+        debug!("Mute applied (prev_muted={:?})", mute_guard.prev_muted);
     }
 
     /// Removes mute if it was applied, restoring the system's prior mute state
@@ -825,56 +816,9 @@ impl AudioRecordingManager {
         }
     }
 
-    /// Opens the microphone unless it is open and healthy, and keeps it
-    /// listening if the mode asks for that.
-    pub fn start_microphone_stream(&self) -> Result<Arc<OpenMicrophone>, anyhow::Error> {
-        let mut open_flag = self.is_open.lock().unwrap();
-        if *open_flag {
-            // `is_open` only records that we opened a stream, not that it is
-            // still running. If the recorder has since failed (mic unplugged,
-            // stalled, permission revoked), rebuild it before the next
-            // recording instead of handing the caller a failed recorder.
-            let open = self.recorder.lock().unwrap().clone();
-            if let Some(microphone) = open.filter(|microphone| !microphone.needs_reopen()) {
-                // trace, not debug: with the aliveness check in
-                // try_start_recording this now fires on every keypress in
-                // always-on mode.
-                trace!("Microphone stream already active");
-                self.keep_listening(&microphone);
-                return Ok(microphone);
-            }
-
-            warn!("Microphone stream failed; reopening");
-
-            // Torn down inline rather than via stop_microphone_stream(), which
-            // takes the `is_open` lock we are already holding.
-            {
-                let mut mute_guard = self.mute_state.lock().unwrap();
-                if mute_guard.did_mute {
-                    restore_mute(mute_guard.prev_muted);
-                    mute_guard.did_mute = false;
-                }
-            }
-            let failed = self.recorder.lock().unwrap().take();
-            drop(failed);
-            *open_flag = false;
-            // Fall through to the same fresh resolution and fallback path used
-            // when an on-demand stream opens after its device was unplugged.
-        }
-
+    /// Opens the selected microphone, or the default one if it is missing.
+    fn open_microphone(&self) -> Result<OpenMicrophone, anyhow::Error> {
         let start_time = Instant::now();
-
-        // Don't mute immediately - caller will handle muting after audio feedback.
-        // The previous stream restored audio on close, so did_mute should already
-        // be false here; if it somehow isn't, restore rather than just clearing the
-        // flag, which would strand system audio muted.
-        {
-            let mut mute_guard = self.mute_state.lock().unwrap();
-            if mute_guard.did_mute {
-                restore_mute(mute_guard.prev_muted);
-                mute_guard.did_mute = false;
-            }
-        }
 
         // Get the selected device from settings, considering clamshell mode.
         // No pre-flight enumeration here: when nothing is configured the
@@ -895,7 +839,7 @@ impl AudioRecordingManager {
         let take_headset = self.airpods_mode.load(Ordering::Acquire);
         let on_failure = self.on_microphone_failure();
         let open_started = Instant::now();
-        let microphone = Arc::new(match open_microphone_on_channel(
+        let microphone = match open_microphone_on_channel(
             resolution.device.clone(),
             channel,
             take_headset,
@@ -918,16 +862,13 @@ impl AudioRecordingManager {
                 )
             }
             result => result,
-        }?);
+        }?;
         debug!(
             "mic stream breakdown: device_resolve={:?} vad_ensure={:?} open={:?}",
             resolve_elapsed,
             vad_elapsed,
             open_started.elapsed()
         );
-        *self.recorder.lock().unwrap() = Some(Arc::clone(&microphone));
-
-        *open_flag = true;
         if let Some(unavailable_name) = resolution.unavailable_selected_microphone {
             // Do this only after the default stream opened successfully. A
             // failed fallback must not erase the user's microphone preference.
@@ -940,56 +881,50 @@ impl AudioRecordingManager {
             "Microphone stream initialized in {:?}",
             start_time.elapsed()
         );
-        self.keep_listening(&microphone);
         Ok(microphone)
     }
 
-    pub fn stop_microphone_stream(&self) {
-        let mut open_flag = self.is_open.lock().unwrap();
-        if !*open_flag {
-            return;
+    /// Brings the idle stream to what the mode and settings ask for. Runs
+    /// under the state lock after every return to idle and every
+    /// configuration change, so the last change decides. A take keeps its
+    /// microphone until it ends, and its end reconciles.
+    fn reconcile(&self, state: &RecordingState) -> Result<(), anyhow::Error> {
+        if !matches!(state, RecordingState::Idle) {
+            return Ok(());
         }
-
-        {
-            let mut mute_guard = self.mute_state.lock().unwrap();
-            if mute_guard.did_mute {
-                restore_mute(mute_guard.prev_muted);
-            }
-            mute_guard.did_mute = false;
+        self.remove_mute();
+        self.close_generation.fetch_add(1, Ordering::SeqCst);
+        let want = self.idle_stream();
+        let mut stream = self.stream.lock().unwrap();
+        stream.settle(want, || self.open_microphone())?;
+        if want == IdleStream::Lingering && stream.is_open() {
+            drop(stream);
+            self.schedule_lazy_close();
         }
-
-        let retired = self.recorder.lock().unwrap().take();
-        drop(retired);
-
-        *open_flag = false;
-        debug!("Microphone stream stopped");
+        Ok(())
     }
 
-    fn keep_listening(&self, microphone: &Arc<OpenMicrophone>) {
-        let current = self
-            .recorder
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|open| Arc::ptr_eq(open, microphone));
-        let mode = *self.mode.lock().unwrap();
-        let airpods = self.airpods_mode.load(Ordering::Acquire);
-        if listens_between_takes(mode, airpods, microphone.needs_reopen(), current) {
-            if let Err(error) = microphone.arm() {
-                warn!("Microphone failed between recordings ({error}); the next one reopens it");
+    /// Reconciles after a configuration change. If that fails, `undo` reverts
+    /// the change and the stream settles as it was.
+    fn reconcile_or_undo(
+        &self,
+        state: &RecordingState,
+        undo: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        self.reconcile(state).inspect_err(|_| {
+            undo();
+            if let Err(error) = self.reconcile(state) {
+                error!("Failed to restore the microphone stream: {error}");
             }
-        }
+        })
     }
 
-    fn settle_idle_stream(&self, microphone: &Arc<OpenMicrophone>) {
-        let mode = *self.mode.lock().unwrap();
-        match mode {
-            MicrophoneMode::OnDemand if get_settings(&self.app_handle).lazy_stream_close => {
-                self.schedule_lazy_close()
-            }
-            MicrophoneMode::OnDemand => self.stop_microphone_stream(),
-            MicrophoneMode::AlwaysOn => self.keep_listening(microphone),
-        }
+    fn idle_stream(&self) -> IdleStream {
+        IdleStream::new(
+            *self.mode.lock().unwrap(),
+            self.airpods_mode.load(Ordering::Acquire),
+            get_settings(&self.app_handle).lazy_stream_close,
+        )
     }
 
     fn collect(&self, sealed: Sealed) -> CollectedAudio {
@@ -1036,10 +971,15 @@ impl AudioRecordingManager {
         }
     }
 
-    fn finish_take(&self, microphone: &Arc<OpenMicrophone>) -> CollectedAudio {
+    fn finish_take(&self, microphone: Arc<OpenMicrophone>) -> CollectedAudio {
         let collected = self.collect(microphone.seal());
-        self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
-        self.settle_idle_stream(microphone);
+        // A device swapped mid-take closes before the new one opens.
+        drop(microphone);
+        let mut state = self.state.lock().unwrap();
+        self.set_state(&mut state, RecordingState::Idle);
+        if let Err(error) = self.reconcile(&state) {
+            warn!("Failed to settle the microphone after a recording: {error}");
+        }
         collected
     }
 
@@ -1048,24 +988,7 @@ impl AudioRecordingManager {
     pub fn update_mode(&self, new_mode: MicrophoneMode) -> Result<(), anyhow::Error> {
         let state = self.state.lock().unwrap();
         let previous = std::mem::replace(&mut *self.mode.lock().unwrap(), new_mode);
-
-        match (previous, new_mode) {
-            (MicrophoneMode::AlwaysOn, MicrophoneMode::OnDemand) => {
-                if matches!(*state, RecordingState::Idle) {
-                    self.close_generation.fetch_add(1, Ordering::SeqCst);
-                    self.stop_microphone_stream();
-                }
-            }
-            (MicrophoneMode::OnDemand, MicrophoneMode::AlwaysOn) => {
-                self.close_generation.fetch_add(1, Ordering::SeqCst);
-                if let Err(error) = self.start_microphone_stream() {
-                    *self.mode.lock().unwrap() = previous;
-                    return Err(error);
-                }
-            }
-            _ => {}
-        }
-        Ok(())
+        self.reconcile_or_undo(&state, || *self.mode.lock().unwrap() = previous)
     }
 
     /* ---------- recording --------------------------------------------------- */
@@ -1124,7 +1047,12 @@ impl AudioRecordingManager {
             // is normally already open and this is a cheap aliveness check —
             // but if the recorder failed (device disconnect), it rebuilds the
             // stream instead of leaving every subsequent start wedged.
-            let microphone = match self.start_microphone_stream() {
+            let opened = self
+                .stream
+                .lock()
+                .unwrap()
+                .ensure_open(|| self.open_microphone());
+            let microphone = match opened {
                 Ok(microphone) => microphone,
                 Err(e) => {
                     error!("Failed to open microphone stream: {e}");
@@ -1147,7 +1075,7 @@ impl AudioRecordingManager {
                     return Err(anyhow::anyhow!("The microphone refused the recording"));
                 }
                 warn!("The microphone refused the recording; reopening");
-                self.stop_microphone_stream();
+                self.stream.lock().unwrap().close();
                 reopened = true;
                 continue;
             }
@@ -1181,10 +1109,10 @@ impl AudioRecordingManager {
         }
     }
 
-    /// Replace the VAD implementation while idle. If the microphone stream is
-    /// currently warm (always-on or lazy-close mode), reopen it with the new
-    /// detector's chunk size before reporting success. A failed reopen restores
-    /// the previous detector so the persisted setting can remain unchanged.
+    /// Replace the VAD implementation while idle. A stream the mode keeps open
+    /// reopens with the new detector's chunk size before reporting success. A
+    /// failed reopen restores the previous detector so the persisted setting
+    /// can remain unchanged.
     pub fn update_vad_backend(&self, backend: VadBackend) -> Result<(), anyhow::Error> {
         let state = self.state.lock().unwrap();
         if !matches!(*state, RecordingState::Idle) {
@@ -1194,51 +1122,24 @@ impl AudioRecordingManager {
         }
 
         let replacement = create_capture_vad(backend, &self.app_handle)?;
-        let was_open = *self.is_open.lock().unwrap();
-
-        // Invalidate any delayed close before swapping the detector.
-        self.close_generation.fetch_add(1, Ordering::SeqCst);
-        if was_open {
-            self.stop_microphone_stream();
-        }
-
         let previous =
             std::mem::replace(&mut *self.vad.lock().unwrap(), VadSlot::Idle(replacement));
-        if was_open {
-            if let Err(change_error) = self.start_microphone_stream() {
-                *self.vad.lock().unwrap() = previous;
-
-                if let Err(rollback_error) = self.start_microphone_stream() {
-                    error!(
-                        "Failed to restore microphone stream after VAD backend change failed: {rollback_error}"
-                    );
-                }
-                return Err(anyhow::anyhow!(
-                    "Failed to reopen microphone with {:?} VAD: {change_error}",
-                    backend
-                ));
-            }
-        }
-
+        self.stream.lock().unwrap().close();
+        self.reconcile_or_undo(&state, || *self.vad.lock().unwrap() = previous)
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to reopen microphone with {backend:?} VAD: {error}")
+            })?;
         info!("VAD backend changed to {:?}", backend);
-        drop(state);
         Ok(())
     }
 
-    /// Moves a warm stream to the newly selected device. A take in progress
-    /// keeps the old device until it ends; the next press opens the new one.
+    /// Moves the stream to the newly selected device. A take in progress keeps
+    /// the old device until it ends; the reconcile at its end opens the new one.
     pub fn update_selected_device(&self) -> Result<(), anyhow::Error> {
         let state = self.state.lock().unwrap();
         self.invalidate_device_cache();
-        let was_open = *self.is_open.lock().unwrap();
-        if was_open {
-            self.close_generation.fetch_add(1, Ordering::SeqCst);
-            self.stop_microphone_stream();
-            if matches!(*state, RecordingState::Idle) {
-                self.start_microphone_stream()?;
-            }
-        }
-        Ok(())
+        self.stream.lock().unwrap().close();
+        self.reconcile(&state)
     }
 
     pub fn update_selected_channel(
@@ -1255,26 +1156,17 @@ impl AudioRecordingManager {
             ));
         }
 
-        let was_open = *self.is_open.lock().unwrap();
-        if was_open {
-            self.close_generation.fetch_add(1, Ordering::SeqCst);
-            self.stop_microphone_stream();
-        }
-        let previous_channel = std::mem::replace(
+        let previous = std::mem::replace(
             &mut *self.selected_channel.lock().unwrap(),
             selected_channel,
         );
-        if was_open {
-            if let Err(error) = self.start_microphone_stream() {
-                *self.selected_channel.lock().unwrap() = previous_channel;
-                return Err(error);
-            }
-        }
-        drop(state);
-        Ok(())
+        self.stream.lock().unwrap().close();
+        self.reconcile_or_undo(&state, || {
+            *self.selected_channel.lock().unwrap() = previous;
+        })
     }
 
-    /// Takes effect on the next open, so a warm stream is reopened.
+    /// Takes effect on the next open, so an open stream is reopened.
     pub fn update_airpods_mode(&self, enabled: bool) -> Result<(), anyhow::Error> {
         let state = self.state.lock().unwrap();
         if !matches!(*state, RecordingState::Idle) {
@@ -1283,20 +1175,11 @@ impl AudioRecordingManager {
             ));
         }
 
-        let was_open = *self.is_open.lock().unwrap();
-        if was_open {
-            self.close_generation.fetch_add(1, Ordering::SeqCst);
-            self.stop_microphone_stream();
-        }
         let previous = self.airpods_mode.swap(enabled, Ordering::AcqRel);
-        if was_open {
-            if let Err(error) = self.start_microphone_stream() {
-                self.airpods_mode.store(previous, Ordering::Release);
-                return Err(error);
-            }
-        }
-        drop(state);
-        Ok(())
+        self.stream.lock().unwrap().close();
+        self.reconcile_or_undo(&state, || {
+            self.airpods_mode.store(previous, Ordering::Release);
+        })
     }
 
     /// Invalidate pending first-sample UI and audio-feedback work immediately.
@@ -1376,7 +1259,7 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let collected = self.finish_take(&microphone);
+                let collected = self.finish_take(microphone);
 
                 if self.was_cancelled_since(cancel_generation) {
                     debug!("Recording stop cancelled; discarding captured samples");
@@ -1440,7 +1323,7 @@ impl AudioRecordingManager {
                 self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
 
-                self.finish_take(&microphone);
+                self.finish_take(microphone);
 
                 // The take is discarded, so its spans end here with a cancel
                 // code rather than waiting incomplete at capture stop.
@@ -1513,23 +1396,5 @@ mod tests {
     fn microphone_config_takes_the_headset_only_in_airpods_mode() {
         assert!(!microphone_config(None, None, false, 480).take_headset);
         assert!(microphone_config(None, None, true, 480).take_headset);
-    }
-
-    #[test]
-    fn only_a_healthy_current_always_on_microphone_keeps_listening() {
-        let mut listening = Vec::new();
-        for mode in [MicrophoneMode::AlwaysOn, MicrophoneMode::OnDemand] {
-            for airpods in [false, true] {
-                for failed in [false, true] {
-                    for current in [false, true] {
-                        if listens_between_takes(mode, airpods, failed, current) {
-                            listening.push((mode, airpods, failed, current));
-                        }
-                    }
-                }
-            }
-        }
-
-        assert_eq!(listening, [(MicrophoneMode::AlwaysOn, false, false, true)]);
     }
 }

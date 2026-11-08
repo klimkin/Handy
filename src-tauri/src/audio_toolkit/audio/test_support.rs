@@ -5,6 +5,7 @@ use std::time::Duration;
 use handy_recorder::testing::FakeMic;
 use handy_recorder::RecorderConfig;
 
+pub(crate) use super::mic_sink::HISTORY_FRAMES;
 use super::{AudioFrameCallback, CaptureSink, CaptureVad, OpenMicrophone, Sealed, VadPolicy};
 use crate::audio_toolkit::vad::{VadFrame, VoiceActivityDetector};
 use crate::diagnostics;
